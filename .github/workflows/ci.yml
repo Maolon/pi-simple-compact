@@ -1,0 +1,125 @@
+name: CI
+on:
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            node: '24'
+          - os: ubuntu-24.04
+            node: '22.16.0'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install exact dependency graph without install scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (offline extension, config, status)
+        run: npm test
+      - name: Pipeline and reducer tests (offline)
+        run: npm run test:pipeline
+      - name: Pi SDK contract tests (real AgentSession, fake providers)
+        run: npm run test:contract
+      - name: Build
+        run: npm run build
+      - name: Package smoke (pack, leak scan, clean install, load with plain Node)
+        run: npm run test:package
+
+  # The oldest Pi release this package supports keeps passing the offline suites.
+  pi-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.16.0'
+      - name: Install with Pi 0.87.1 in place of the default Pi
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm install --ignore-scripts --no-audit --no-fund --no-save \
+            @earendil-works/pi-ai@0.87.1 @earendil-works/pi-coding-agent@0.87.1
+      - name: Typecheck and offline suites against Pi 0.87.1
+        run: npm run check
+
+  # Real Pi TUI in tmux with deterministic offline providers, against the compiled package entry.
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install exact dependency graph without install scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: tmux end-to-end scenarios
+        env:
+          PSC_E2E_ENTRY: dist
+          TERM: xterm-256color
+        run: npm run test:e2e
+      - name: Keep pane captures of failed scenarios
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: e2e-pane-captures
+          path: e2e-artifacts/
+          if-no-files-found: ignore
+
+  # Merging into main publishes to npm, so a PR into main must be a release or hotfix branch
+  # that carries a version npm has not seen and a matching CHANGELOG entry.
+  release-guard:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Head branch is release/* or hotfix/*
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          case "$HEAD_REF" in
+            release/*|hotfix/*) ;;
+            *) echo "::error::PRs into main must come from release/* or hotfix/* (got $HEAD_REF)"; exit 1 ;;
+          esac
+      - name: Version is new on npm and listed in CHANGELOG
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "::error::$name@$version is already on npm; bump package.json before merging into main"; exit 1
+          fi
+          case "$HEAD_REF" in
+            release/*) [ "${HEAD_REF#release/}" = "$version" ] || { echo "::error::branch $HEAD_REF does not match package.json version $version"; exit 1; } ;;
+          esac
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## [$version]' entry"; exit 1; }
