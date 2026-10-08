@@ -7,3 +7,5 @@ coverage/
 .env.*
 *.log
 .DS_Store
+*.tgz
+e2e-artifacts/

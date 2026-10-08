@@ -40,6 +40,7 @@ export type SessionProfileEntry = {
 
 type ProfileField = "model" | "prompt" | "thinkingLevel" | "mode" | "failurePolicy";
 const PROFILE_FIELDS: readonly ProfileField[] = ["model", "prompt", "thinkingLevel", "mode", "failurePolicy"];
+const PROMPT_PLACEHOLDERS: readonly string[] = ["conversation", "previousSummary", "turnPrefix", "customInstructions"];
 const COMPACT_THINKING_LEVELS: readonly CompactThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PIPELINE_FIELDS = ["model", "prompt", "routes", "maxInputChars", "maxOutputChars", "maxOutputTokens"] as const;
 const PIPELINE_ROUTE_FIELDS = ["model", "prompt", "reducer"] as const;
@@ -73,6 +74,11 @@ function parseProfile(value: unknown, where: string): CompactProfile {
   if ("prompt" in value) {
     if (typeof value.prompt !== "string" || !value.prompt.trim()) {
       throw new Error(`${where}.prompt must be a non-empty string`);
+    }
+    for (const match of value.prompt.matchAll(/\{\{([^{}]+)\}\}/g)) {
+      if (!PROMPT_PLACEHOLDERS.includes(match[1]!)) {
+        throw new Error(`${where}.prompt has unsupported placeholder {{${match[1]}}}; use ${PROMPT_PLACEHOLDERS.map((key) => `{{${key}}}`).join(", ")}`);
+      }
     }
     profile.prompt = value.prompt;
   }
@@ -194,9 +200,10 @@ export function parseConfigFile(text: string, source: string): ProfileConfigFile
     // Report only the location: JSON engine messages can quote parts of the file.
     const message = error instanceof Error ? error.message : "";
     const position = /\bposition (\d+)/.exec(message);
+    const atEnd = /end of JSON input/i.test(message);
     let location = "";
-    if (position) {
-      const offset = Math.min(Number(position[1]), text.length);
+    if (position || atEnd) {
+      const offset = position ? Math.min(Number(position[1]), text.length) : text.length;
       const before = text.slice(0, offset).split("\n");
       location = ` (line ${before.length}, column ${before.at(-1)!.length + 1})`;
     }
@@ -235,12 +242,14 @@ async function hasPiTrustCompanion(cwd: string): Promise<boolean> {
 }
 
 export async function loadProfileConfig(agentDir: string, cwd: string, projectTrusted: boolean): Promise<LoadedProfileConfig> {
-  const userConfig = readConfig(join(agentDir, CONFIG_FILE_NAME));
-  const mayReadProject = projectTrusted && await hasPiTrustCompanion(cwd);
-  const projectConfig = mayReadProject
-    ? readConfig(join(cwd, ".pi", CONFIG_FILE_NAME))
-    : Promise.resolve({});
-  const [user, project] = await Promise.all([userConfig, projectConfig]);
+  // Both reads join one Promise.all immediately: a user-file rejection that settles while the
+  // trust check is pending must never become an unhandled rejection (Pi exits on those).
+  const [user, project] = await Promise.all([
+    readConfig(join(agentDir, CONFIG_FILE_NAME)),
+    (async (): Promise<ProfileConfigFile> => (
+      projectTrusted && await hasPiTrustCompanion(cwd) ? readConfig(join(cwd, ".pi", CONFIG_FILE_NAME)) : {}
+    ))(),
+  ]);
   return { user, project };
 }
 

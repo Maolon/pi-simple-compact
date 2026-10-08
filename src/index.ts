@@ -19,6 +19,19 @@ import { deterministicFactsReducer } from "./reducers.ts";
 import { promptSummaryAdapter, summarizeWithPiPrompt } from "./summary-adapter.ts";
 import type { CompactSummaryAdapter, CustomSummaryRequest } from "./summary-adapter.ts";
 
+export type { CompactProfile, ProfileConfigFile } from "./config.ts";
+export type {
+  CompactThinkingLevel,
+  HistoryItem,
+  HistoryKind,
+  NonLlmReducer,
+  PipelineOptions,
+  PipelineRoute,
+  ReducerInput,
+  SummarySharedContext,
+  ToolInteraction,
+} from "./pipeline.ts";
+
 export const BUILTIN_REDUCER_NAMES = { deterministicFacts: "deterministic-facts" } as const;
 const BUILTIN_REDUCERS: Record<string, NonLlmReducer> = {
   [BUILTIN_REDUCER_NAMES.deterministicFacts]: deterministicFactsReducer,

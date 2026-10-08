@@ -1,153 +1,314 @@
 # pi-simple-compact
 
-A compact-only Pi extension for **@earendil-works/pi-coding-agent 0.87.1**. It is inert by default: when no profile applies, its `session_before_compact` handler returns `undefined` so Pi runs its own compaction path. It does not change the chat model, trigger thresholds, session messages, other hooks, or `/tree` branch summaries.
+Choose the model, the prompt and the pipeline [Pi](https://pi.dev) uses when it compacts a session, and change
+nothing else. With no configuration this extension does nothing at all: Pi compacts exactly as it always does.
 
-## Development checks
-
-```sh
-npm install
-npm run typecheck
-npm test
+```bash
+pi install npm:@maolon/pi-simple-compact
 ```
 
-Tests use fake/offline model-registry responses and the Pi SDK's in-memory `SessionManager`. They do not call a provider, inspect live sessions, or install the extension into Pi's live extension directory.
+## Why
 
-## Local opt-in
+Compaction summarizes old history so a long session fits the context window again. Pi runs it with your
+current chat model and its built-in prompt. That is a good default, but sometimes you want something else:
 
-For a one-off local load, use Pi's explicit extension flag with this repository's source file:
+- **A different summarizer.** Chat with a strong, expensive model and compact with a fast, cheap one, or use a model
+  with a bigger context window for the summary.
+- **Your own prompt.** Keep the details your work depends on, in the shape you want.
+- **Typed processing.** Summarize tool output, user requests and assistant reasoning differently, or reduce some of
+  them with deterministic local code instead of a model.
 
-```sh
-pi --extension /absolute/path/to/pi-simple-compact/src/index.ts
+pi-simple-compact does this **only inside compaction**. It never changes your chat model, thinking level, trigger
+thresholds, tools, session history, `/tree` branch summaries or any other hook.
+
+## How it works
+
+```
+ Pi decides to compact (/compact, threshold or overflow)
+            │
+            ▼
+ session_before_compact ──► resolve profile ──► none / native ──► return nothing: Pi compacts natively
+                                   │
+                                   ├── model only ────────► Pi's own compact() with another model
+                                   ├── prompt ────────────► one request with your prompt
+                                   └── pipeline ──────────► typed stages (reducers and/or models)
+                                   │
+                                   ▼
+               one summary + Pi's own boundary ──► Pi stores it as a normal compaction entry
 ```
 
-No live activation or global installation is performed by this package. Profiles are opt-in JSON files:
+Pi still prepares the compaction: which messages are summarized, where the retained tail starts and how many tokens
+were used. The extension only produces the summary text. Raw history stays in Pi's session file, and the result is
+an ordinary Pi compaction entry.
 
-- User: `~/.pi/agent/pi-simple-compact.json`
-- Project: `<project>/.pi/pi-simple-compact.json` (read only when `ctx.isProjectTrusted()` is true **and** `<project>/.pi/settings.json` exists)
+## Requirements
 
-The user file is always eligible. Project-local compact profiles are read only when both `ctx.isProjectTrusted()` is true and `.pi/settings.json` exists, using that Pi-recognized companion to ensure a lone extension-specific file cannot opt itself into project trust. The same check applies to `/compact-profile` named-profile lookup. This applies to an explicitly loaded `-e` extension too: Pi resolves project trust before compaction handlers run, and the public getter reflects that session trust state.
+- Pi (`@earendil-works/pi-coding-agent`). Tested with 0.87.1 and 1.1.0; other versions are untested.
+- Node.js 22.16 or newer.
 
-Example:
+## Install
+
+```bash
+pi install npm:@maolon/pi-simple-compact
+```
+
+Use `-l` to install into the current project (`.pi/settings.json`) instead of your personal settings, or try it
+for one run with `pi -e npm:@maolon/pi-simple-compact`. Pin versions with `npm:@maolon/pi-simple-compact@0.1.0`.
+
+Nothing changes until you add a profile.
+
+## Quick start
+
+Compact with a cheaper model while you keep chatting with your current one. Create
+`~/.pi/agent/pi-simple-compact.json`:
 
 ```json
 {
-  "default": {
-    "model": "google/gemini-2.5-flash",
-    "failurePolicy": "fail"
-  },
+  "default": { "model": "google/gemini-2.5-flash" }
+}
+```
+
+The model is an exact, case-sensitive `provider/modelId` from `pi --list-models`. Pi's registry provides its
+credentials. Run `/compact` and the summary comes from that model through Pi's own compaction prompt. During the
+compaction the footer shows `Manual compact (gemini-2.5-flash)` (`Auto compact (...)` for automatic ones).
+
+> **Privacy.** A configured summarizer receives the history being compacted, including tool calls and tool output,
+> from the session. If you choose a different provider from your chat provider, that data goes to it. A typed
+> pipeline can send different kinds of history to different providers. Configure only providers you trust with
+> that data.
+
+## Configuration
+
+Profiles live in JSON files:
+
+| File | Read when |
+|---|---|
+| `~/.pi/agent/pi-simple-compact.json` (or `$PI_CODING_AGENT_DIR/pi-simple-compact.json`) | always |
+| `<project>/.pi/pi-simple-compact.json` | only when Pi trusts the project **and** `<project>/.pi/settings.json` exists |
+
+A project file on its own cannot opt itself in: Pi must have granted project trust, and the project must have the
+Pi settings file that trust covers.
+
+### File shape
+
+```json
+{
+  "default": { "model": "google/gemini-2.5-flash" },
   "models": {
-    "anthropic/claude-sonnet-4": {
-      "model": "google/gemini-3.8-flash",
-      "thinkingLevel": "high"
-    }
+    "anthropic/claude-sonnet-4": { "model": "google/gemini-2.5-flash", "thinkingLevel": "high" }
   },
   "profiles": {
     "focused": {
       "model": "google/gemini-2.5-flash",
-      "prompt": "Summarize the history: {{conversation}}\nPrior summary: {{previousSummary}}\nFocus: {{customInstructions}}"
+      "prompt": "Summarize this coding session.\n{{conversation}}\nPrior summary: {{previousSummary}}\nFocus: {{customInstructions}}"
     }
   }
 }
 ```
 
-A model is an exact, case-sensitive `provider/modelId` resolved through Pi's model registry. It only selects the compaction summarizer; it never calls `pi.setModel()` or alters Pi's chat model. The registry resolves provider authentication when making the request. Choosing another provider sends the discarded conversation/tool material needed for that compact job to that provider; configure and trust it accordingly.
+- `default`: applies to every chat model.
+- `models`: applies when the **current chat model** is exactly that `provider/modelId`.
+- `profiles`: named profiles you select per session with `/compact-profile <name>`.
 
-### Profile precedence and session selection
+Each profile can set:
 
-Settings resolve **per field** from highest to lowest priority:
+| Field | Meaning |
+|---|---|
+| `model` | `provider/modelId` of the summarizer. Default: the current chat model. |
+| `prompt` | Replace Pi's compaction prompt (see [Replacement prompt](#replacement-prompt)). |
+| `pipeline` | Typed per-kind processing (see [Typed pipeline](#typed-pipeline)). Cannot be combined with `prompt`, even from different files or layers. |
+| `thinkingLevel` | Summarizer reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Compaction only. |
+| `failurePolicy` | `fail` (default) or `native`. See [Failures](#failures). |
+| `mode` | `native`: hand compaction back to Pi and ignore lower-priority profiles. |
 
-1. named profile selected in the active session;
-2. project exact-chat-model override;
-3. user exact-chat-model override;
-4. project default;
-5. user default;
-6. Pi native behavior.
+A `prompt` and a `pipeline` that meet from different layers (say, a project `models` entry with `prompt` over a
+user `default` with `pipeline`) are a configuration error and cancel compaction with a notice.
 
-Use `/compact-profile focused` to select a named profile in the current session branch, `/compact-profile native` to explicitly yield compaction to Pi, and `/compact-profile reset` to append a reset marker and inherit settings again. The extension stores this small state as a Pi custom session entry; it is not added to model context. Branch switches naturally follow the active branch, and session reload reads the branch's entries. Named profiles must be present in either config file before selecting them.
+A profile with no `model`, `prompt` or `pipeline` does not intercept compaction. A `thinkingLevel` on its own
+therefore stays native, because it only adjusts a configured summarizer.
 
-An explicit `"mode": "native"` on the highest-priority profile suppresses inherited profile settings. With no `model`, `prompt`, or `pipeline`, configuration does not intercept compaction (a `thinkingLevel`-only profile therefore stays native; the level decorates a configured summarizer). A model-only profile calls Pi's exported `compact(preparation, ...)` helper and uses `ModelRegistry.streamSimple`, preserving Pi's prompt, split-turn behavior, boundary, and file-operation details. For a split turn only, after Pi returns, the extension annotates its uniquely recognized history/turn-prefix separator with `[HISTORY]` (messages before the split turn) and `[TURN_PREFIX]` (the earlier part of that turn, before retained messages). These are **source labels, not reliability rankings**: a turn prefix can quote an outdated task. The note asks the model to resolve status conflicts using explicit completion evidence and retained messages, not section order alone. The Pi-generated section text, usage, file tags, and retained boundary are not rewritten; unknown or ambiguous separator formats pass through unchanged. The labels do not reconcile contradictions or trigger another model request. Zero-config/native pass-through and non-split results remain unmodified. Existing session summaries with the former `[PREV]`/`[RECENT]` labels are not rewritten; `/reload` applies this change to future eligible compactions. A conservative preflight rejects prepared spans that cannot fit the selected model's estimated input budget; this native-helper path is not chunked. A missing prompt therefore never substitutes an extension-owned prompt.
+### Precedence
 
-### Compact-only thinking level
+Settings resolve **per field**, highest priority first:
 
-A profile may set `thinkingLevel` to one of Pi's levels — `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` — for the compaction summarizer request only. Invalid values are rejected at config load (compaction is canceled rather than silently degraded). The field resolves per field with the same precedence as `model` and `prompt`, and it applies **only inside compaction**:
+1. the named profile selected in this session;
+2. project `models` entry for the current chat model;
+3. user `models` entry for the current chat model;
+4. project `default`;
+5. user `default`;
+6. Pi's native behavior.
 
-- a model-only profile passes the effective level to Pi's exported `compact()` helper, so the native compact prompt runs with that reasoning level;
-- a replacement-prompt profile sets the `reasoning` request field when the selected model reports reasoning support;
-- a typed pipeline applies an explicitly configured level to every LLM stage whose stage model reports reasoning support; when the field is absent, pipeline stage requests are unchanged.
+### Per-session selection
 
-When the profile omits `thinkingLevel`, the model-only and replacement-prompt paths inherit the current chat session thinking level (the previous behavior), and `"off"` explicitly sends no reasoning field even while chat thinking is active. The extension never calls `pi.setThinkingLevel()` and never changes the chat model or the session's thinking setting — only the compact summarizer request differs. Higher levels can increase compact cost and latency; the summarized material still goes only to the profile's configured provider.
+```
+/compact-profile focused    use the named profile in this session
+/compact-profile native     use Pi's native compaction in this session
+/compact-profile reset      go back to the inherited settings
+```
+
+The choice is stored as a small custom entry in the session. It follows the active branch, survives restarts and
+`--continue`, and never enters model context. `/compact-profile native` works even when a configuration file is
+broken, so you always have a way back to Pi's own compaction.
+
+## Summarization strategies
+
+### Model only
+
+With just `model` (and optionally `thinkingLevel`), the extension calls Pi's exported `compact()` helper with that
+model. Pi's prompt, split-turn handling, file tracking and result format stay exactly as they are.
+
+When Pi splits a turn, it summarizes the history and the beginning of the split turn separately and joins the two
+parts. The extension adds a `[HISTORY]` and a `[TURN_PREFIX]` label to Pi's separator. The labels say where each part
+came from, not which one is more reliable: a turn prefix can quote old tasks. Each label tells the model to resolve
+conflicting status from explicit completion evidence and the retained messages. If the separator is missing or
+appears more than once, the summary passes through unchanged.
 
 ### Replacement prompt
 
-Set `prompt` to replace Pi's compact prompt. The supported placeholders are:
+`prompt` replaces Pi's compaction prompt with one request to the summarizer. Placeholders:
 
-- `{{conversation}}` — Pi-serialized visible messages to summarize;
-- `{{previousSummary}}` — the prior compact summary, when present;
-- `{{turnPrefix}}` — messages in a split user-message span;
-- `{{customInstructions}}` — manual `/compact [instructions]` focus.
+| Placeholder | Value |
+|---|---|
+| `{{conversation}}` | the messages being summarized, serialized the way Pi does it |
+| `{{previousSummary}}` | the previous compaction summary, if any |
+| `{{turnPrefix}}` | the beginning of a split turn, if any |
+| `{{customInstructions}}` | the text after `/compact`, if any |
 
-When a placeholder is omitted, its non-empty value is appended in a labeled block; the visible conversation is always included. A split-turn replacement prompt receives the older summarized messages as `{{conversation}}` and the split prefix separately as `{{turnPrefix}}` in the same whole-summary request; the prefix is not duplicated in `conversation`. The request is checked against the selected model's estimated input budget and fails closed if oversized; no chunking is attempted. The response must end with `stop`, contain text, and contain no tool calls. Abort, empty, length, error, deferred, and other non-final responses are rejected without returning a partial compaction.
+A placeholder you leave out is appended in a labeled block when it has a value, so the conversation is always
+included. Unknown placeholders are rejected when the configuration is loaded. Read and modified files are appended as `<read-files>` and
+`<modified-files>` tags, like Pi does.
 
-Configured failures fail closed by default: the hook returns `{ cancel: true }` instead of throwing (Pi 0.87.1 swallows hook exceptions and would otherwise continue with native compaction). If UI is available, the extension emits a sanitized notice; otherwise it writes a sanitized fixed diagnostic to stderr. It never includes provider error text or transcript content. Pi 0.87.1 represents this extension cancellation in `session_compact_failed` as `aborted: true` with no `errorMessage`; that is a limitation of the public hook result, and this package does not label the underlying provider failure as a Pi error outcome. Set `"failurePolicy": "native"` to explicitly ask Pi to continue with its normal summarizer on a non-abort configured summary failure. A genuine abort/cancellation never falls back. Invalid JSON/profile configuration also cancels rather than silently reverting.
+### Typed pipeline
 
-## Compact activity status (TUI)
-
-When a non-native profile intercepts compaction, the interactive TUI footer (outside Pi's built-in `[compaction]` card) shows a keyed status while the configured summarizer runs:
-
-- automatic threshold/overflow compaction: `Auto compact (<model id>)`;
-- manual `/compact`: `Manual compact (<model id>)`.
-
-The label names what this attempt actually uses. A model-only or replacement-prompt profile shows the exact selected model id (the current chat model when no override is configured). A typed pipeline shows a single model id only when every LLM stage of this attempt resolves to that same model; otherwise it stays honest with `pipeline, multiple models` or `pipeline, local reducers` instead of naming one model.
-
-The status is **only visible while compaction is running**. It clears on `session_compact` (success or another extension's result), `session_compact_failed` (including cancellation and fail-closed aborts), native pass-through/fallback, and `session_shutdown` (quit, reload, or session replacement); it does not leave a `Last ...` footer behind. Zero-config and explicit native pass-through never create an extension status. Pi 0.87.1 hardcodes the native card's `Compacted from ... tokens` text, so the extension cannot insert the model name inside that card without modifying Pi core. An immediate completion notification from `session_compact` would be erased by Pi's following TUI redraw; no completion notification is attempted.
-
-Status calls are restricted to `ctx.mode === "tui"`, so RPC/JSON/print behavior is unchanged. A failing UI call is swallowed and cannot change the compaction result, its failure policy, or fallback semantics. The status contains only the model label — never transcripts, provider responses, or credentials.
-
-## API/evidence boundaries
-
-Production code listens only to Pi's public compaction lifecycle events — `session_before_compact` for behavior and `session_compact`, `session_compact_failed`, and `session_shutdown` solely to update the compact-only TUI status — and uses `event.preparation`; it does not import Pi's internal `prepareCompaction`. No `context`, `context_with_system`, message, tool-result, or branch-summary hooks are registered. Pi retains ownership of native execution whenever the extension returns `undefined`.
-
-The locally installed 0.87.1 SDK provides the event's `preparation`, `signal`, `reason`, `customInstructions`, and `willRetry`; root exports include `compact`, `convertToLlm`, `serializeConversation`, `CompactionResult`, and `ModelRegistry`. `@earendil-works/pi-ai` publicly exports `uuidv7`; each configured typed-stage and replacement-prompt request gets a fresh one-off routing ID rather than the active chat session ID. The model-only native helper and native passthrough are unchanged. `ModelRegistry.streamSimple()` is documented as provider-neutral and authenticated at request time. Pi's source calls extension-provided compaction results the hook outcome and persists them with its extension marker; summaries are rebuilt alongside messages beginning at `firstKeptEntryId`. Pi authenticates the current chat model before invoking `session_before_compact`, including for alternate-model profiles, so this extension does not rescue unavailable chat-model auth.
-
-## Typed pipeline
-
-A nested `pipeline` opts into typed per-kind reduction, leaving the top-level `prompt` semantics unchanged. A top-level profile `model` is the fallback model for pipeline LLM stages; nested `pipeline.model` and per-kind route fields take precedence. Top-level `prompt` and `pipeline` cannot be set together, including when conflicting fields arrive from different profile-precedence layers.
+A `pipeline` splits the history by kind and handles each kind in its own stage:
 
 ```json
 {
   "default": {
+    "model": "google/gemini-2.5-flash",
     "pipeline": {
-      "maxInputChars": 64000,
-      "maxOutputChars": 32000,
-      "maxOutputTokens": 4096,
       "routes": {
         "user": { "reducer": "deterministic-facts" },
-        "assistant": { "prompt": "Preserve decisions, progress and next steps." },
-        "toolCall": { "reducer": "deterministic-facts" },
-        "toolResult": { "model": "google/gemini-2.5-flash" }
+        "assistant": { "prompt": "Keep decisions, progress and next steps." },
+        "toolResult": { "model": "openai/gpt-5-mini" }
       }
     }
   }
 }
 ```
 
-Known kinds are `user`, `assistant`, `thinking`, `toolCall`, `toolResult`, `custom`, `bashExecution`, and `branchSummary`. Per-kind `model`, `prompt`, and `reducer` fields merge field-by-field across profile precedence. A route with only `reducer` is terminal; add that route's `model` or `prompt` to feed its parser result into an LLM stage. Each typed LLM stage has its own fresh UUIDv7 routing ID; no stage reuses the active chat session ID. The pipeline reads Pi's canonical projected session context, links calls/results by `toolCallId`, supplies bounded prior-summary/manual-focus/split-prefix/current-task context to each LLM stage, aggregates usage, and includes visible read/modified file tags with details carried forward across pipeline compactions.
+- Kinds: `user`, `assistant`, `thinking`, `toolCall`, `toolResult`, `custom`, `bashExecution`, `branchSummary`
+  (prior branch and compaction summaries).
+- A route can set `model`, `prompt` and `reducer`. A route with only `reducer` is handled entirely by local code, and
+  nothing of that kind is sent to a model. With `model` or `prompt` added, the model receives the reducer's output
+  **and** the raw records of that kind.
+- Kinds without a route use `pipeline.model`, then the profile `model`, then the current chat model.
+- Tool calls and results are linked by `toolCallId`, and a result without its call is kept.
+- Every stage receives the same bounded shared context: the previous summary, `/compact` instructions, the latest
+  user request and an excerpt of a split turn.
+- The stage outputs are joined into one summary with a section per kind.
 
-The built-in deterministic reducer is named `deterministic-facts`. JSON only selects registered names; it cannot load arbitrary code or execute commands. Trusted extension code may pass additional functions into the registry:
+Limits (optional, inside `pipeline`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `maxInputChars` | 64000 | characters per request (also capped by the model's context window) |
+| `maxOutputChars` | 32000 | characters in the final summary, shared equally by the kinds present; a kind whose output exceeds its share fails the compaction |
+| `maxOutputTokens` | 4096 | output tokens per stage (also capped by Pi's reserve and the model) |
+
+When a kind does not fit in one request, it is sent in parts. Each part carries a bounded checkpoint of the earlier
+parts, and the last part's answer becomes the stage output. A single record that is too large on its own is sent
+as a marked head and tail excerpt. Every request is planned and size-checked before the first model call.
+Compaction still fails when:
+
+- the fixed part of a request (prompt and shared context) leaves no room for records;
+- a reducer's input exceeds `maxInputChars` (reducers receive their whole kind and are not split);
+- Pi's compaction reserve is too small for the number of model stages;
+- a stage's output exceeds its share of `maxOutputChars` (checked after that stage runs).
+
+`deterministic-facts` is the built-in reducer. It lists the de-duplicated records of its kind in order, after the
+shared context (latest user request, previous summary, `/compact` instructions and split-turn excerpt), so each
+reducer section repeats that context. JSON configuration can only name reducers. It cannot load code.
+
+#### Custom reducers
+
+Trusted local code can register more reducers. Write your own Pi extension or package that depends on
+`@maolon/pi-simple-compact` through npm and calls `registerSimpleCompact` with them:
 
 ```ts
-import { registerSimpleCompact } from "/absolute/path/pi-simple-compact/src/index.ts";
-import type { NonLlmReducer } from "/absolute/path/pi-simple-compact/src/pipeline.ts";
+import { registerSimpleCompact, type NonLlmReducer } from "@maolon/pi-simple-compact";
 
-const localFacts: NonLlmReducer = (input, shared, signal) => {
+const errorsOnly: NonLlmReducer = (input, _shared, signal) => {
   signal.throwIfAborted();
-  return input.items.map((item) => item.text).filter(Boolean).join("\n");
+  return input.items.filter((item) => item.isError).map((item) => item.text).join("\n") || "No errors.";
 };
-export default (pi) => registerSimpleCompact(pi, undefined, { reducers: { "local-facts": localFacts } });
+
+export default (pi) => registerSimpleCompact(pi, undefined, { reducers: { "errors-only": errorsOnly } });
 ```
 
-Load that wrapper instead of also loading the default extension entry. The registry rejects collisions with built-ins. Pipeline input/output and each model context are bounded; oversized requests fail clearly before that stage rather than being chunked. LLM routes use Pi's provider-neutral authenticated `ModelRegistry.streamSimple()` and `event.signal`. A deliberately small Pi compaction reserve can make a stage response end with `length`; it is rejected, and no partial summary is silently persisted. The model-only native-helper path retains Pi's split prompt and input handling; if an alternate model rejects its request for context size, the configured compaction fails closed rather than being chunked.
+Load only that extension. Do not also `pi install` this package, or two copies register the same hook and command.
+If you must install both, disable this package's own entry in Pi settings with
+`{ "source": "npm:@maolon/pi-simple-compact", "extensions": [] }`. Reducer names cannot collide with built-ins.
 
-## Current validation boundary
+## Failures
 
-Automated tests are offline and cover the typed pipeline, deterministic reducers, profile/route precedence, canonical context edits/omissions, native passthrough, alternate fake-provider routing, compact-only thinking-level resolution and request propagation (parse/invalid/per-field precedence, high passed to a fake alternate summarizer with chat thinking off, replacement-prompt and pipeline coverage, absent-field behavior unchanged), repeated compaction, session-profile restoration, trust companion gating, fail-closed outcomes, retained-tail reconstruction, the TUI compact activity status (auto/manual labels, per-attempt model/pipeline labels, completion, failure, native fallback, shutdown cleanup, non-TUI silence, and UI-failure tolerance), and a real SDK `AgentSession.compact()` with fake providers. Separate operator validation on Pi 0.87.1 used synthetic prompts to verify native RPC/TUI compaction, live DeepSeek v4.1 model-only cross-provider compaction, and an uninstrumented typed pipeline with a deterministic reducer; the local evidence is in `../pi-simple-compact-context/LIVE_TEST_REPORT-2026-09-22.md` (not packaged). Actual threshold/overflow scheduling, arbitrary provider credentials, and large-context chunking remain unverified/out of scope; the automated contract fixture exercises manual compaction only, and the visual footer rendering of the keyed status is verified offline through `ExtensionUIContext` spies — a live TUI run of the indicator itself is left to operator validation.
+A configured compaction is rejected when the summarizer returns no text, stops because of a length limit, errors,
+is aborted or tries to call a tool. A partial summary is never stored.
+
+- **`failurePolicy: "fail"` (default).** Compaction is canceled and a short notice explains why. Pi does not
+  silently fall back to its native summarizer, because that would send your history to a model you did not choose
+  for compaction. Pi reports this cancellation as `aborted` in `session_compact_failed`; the public hook result has
+  no way to report an error message.
+- **`failurePolicy: "native"`.** Pi runs its native compaction instead, and a warning says so. A real cancellation
+  (Escape) never falls back.
+- **Invalid configuration** cancels compaction with a notice that names the file and, where possible, the line and
+  column or the field, never its contents. Fix the file or run `/compact-profile native`.
+
+The model-only and replacement-prompt strategies are not split into parts. If the history does not fit the
+summarizer's context window, they fail before any request. Pick a summarizer with
+a large enough window, use a pipeline, or set `failurePolicy: "native"`.
+
+## Status in the TUI
+
+While a configured compaction runs, the footer shows `Manual compact (<model>)` or `Auto compact (<model>)`. A
+pipeline shows one model when all its model stages use the same one, and otherwise `pipeline, multiple models` or
+`pipeline, local reducers`. The status disappears when compaction finishes, fails or is canceled. Native compaction
+never shows it, and print, JSON and RPC modes are not affected.
+
+## Data and privacy
+
+- The extension makes model requests only when a profile asks for them, and only during compaction.
+- It sends only the material of the compaction being run, and only to the providers you configured.
+- Notices and diagnostics contain no conversation text, provider responses or credentials.
+- It stores only the per-session profile choice and the compaction result Pi already stores.
+
+## Status
+
+0.1 is an early release.
+
+- **Tested automatically:** every strategy, profile precedence, project trust gating, session profiles across
+  restarts, failures, cancellation and status cleanup. The tests use a real Pi `AgentSession` and fake
+  providers. A tmux suite drives the real Pi TUI with offline providers through native, model-only, failing,
+  broken-config, pipeline, automatic-threshold and restart scenarios. The offline suites run against Pi 0.87.1 and
+  1.1.0.
+- **Tested by hand:** a few real providers, including a cross-provider summarizer and a hybrid pipeline. Other
+  providers have not been tried. Overflow-triggered compaction has not been reproduced with a real provider.
+- **Not included:** a reconciliation pass that resolves contradictions between the two parts of a split-turn summary.
+  The labels only mark which part is which.
+
+## Development
+
+```bash
+npm install
+npm run check            # typecheck, unit, pipeline and Pi SDK contract tests (offline)
+npm run build            # dist/
+npm run test:package     # pack, leak scan, clean install, load with plain Node
+npm run test:e2e         # real Pi TUI in tmux with offline fake providers (needs tmux)
+```
+
+`PSC_E2E_ENTRY=dist npm run test:e2e` runs the tmux suite against the built package. To load your working copy in
+Pi, run `pi -e ./src/index.ts`. See [AGENTS.md](AGENTS.md) for conventions and the release flow.
+
+## License
+
+[MIT](LICENSE)
