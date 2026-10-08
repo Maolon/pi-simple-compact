@@ -102,6 +102,9 @@ interface GroupPlan {
   runLlm: boolean;
   model?: Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[0];
   prompt?: string;
+  /** LLM stages only: output-token cap and the request character limit (configured and context-window bound). */
+  maxTokens?: number;
+  inputLimit?: number;
 }
 
 interface StageDetail {
@@ -110,7 +113,11 @@ interface StageDetail {
   provider?: string;
   modelId?: string;
   reducer?: string;
+  /** Number of sequential requests when the stage input was split into parts. */
+  parts?: number;
   usage?: Usage;
+  /** True when at least one provider response for this stage carried no usage data. */
+  usageMissing?: true;
 }
 
 interface PipelineDetails {
@@ -176,6 +183,12 @@ const DEFAULT_MAX_OUTPUT_CHARS = 32_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
 const MAX_SHARED_TASK_CHARS = 4_000;
 const MAX_SHARED_PREFIX_CHARS = 4_000;
+const MAX_SHARED_FOCUS_CHARS = 4_000;
+/** Counterpart tool records in an LLM payload are excerpts; the full record belongs to its own typed stage. */
+const MAX_TOOL_COUNTERPART_CHARS = 1_000;
+const STAGE_HEADING_RESERVE_CHARS = 64;
+const CHUNK_INSTRUCTIONS =
+  "This history kind is too large for one request, so it arrives in numbered parts. `previousPartCheckpoint` is your checkpoint of the earlier parts. Return one updated checkpoint that covers every part so far.";
 const DEFAULT_LLM_PROMPT =
   "Produce a concise factual checkpoint for this history kind. Preserve concrete decisions, constraints, progress, unresolved questions, and exact technical details that are useful later. Do not invent missing information.";
 const SYSTEM_PROMPT =
@@ -206,6 +219,8 @@ interface PreparedPipelinePlans {
   toolInteractions: ToolInteraction[];
   shared: SummarySharedContext;
   plans: GroupPlan[];
+  /** Maximum characters of an intermediate part checkpoint carried into the next part. */
+  rollingCap: number;
 }
 
 /** Project the prepared span and resolve every typed stage plan without running it. */
@@ -238,18 +253,45 @@ function preparePipelinePlans(
 
   const allItems = [...historyItems, ...splitPrefix];
   const toolInteractions = linkToolInteractions(allItems);
-  const taskCapsule = findTaskCapsule(projectedEntries);
-  const shared: SummarySharedContext = {
-    ...(preparation.previousSummary !== undefined ? { previousSummary: preparation.previousSummary } : {}),
-    ...(event.customInstructions !== undefined ? { manualFocus: event.customInstructions } : {}),
-    splitPrefix: buildSplitPrefixCapsule(splitPrefix),
-    ...(taskCapsule ? { taskCapsule } : {}),
-  };
   // Each typed stage owns all its records, including split-prefix records of that kind.
   // Shared context carries only a bounded prefix excerpt to avoid repeating a huge turn.
   const groups = groupHistory(allItems);
   const plans = buildPlans(groups, toolInteractions, options, ctx, reducers);
-  return { projectedEntries, toolInteractions, shared, plans };
+  assignStageBudgets(plans, options, preparation.settings.reserveTokens);
+
+  // Shared context repeats in every request, so its parts scale with the smallest request limit.
+  const maxInputChars = options.maxInputChars ?? DEFAULT_MAX_INPUT_CHARS;
+  const smallestLimit = Math.min(maxInputChars, ...plans.flatMap((plan) => (plan.inputLimit !== undefined ? [plan.inputLimit] : [])));
+  const excerptCap = (cap: number) => Math.max(0, Math.min(cap, Math.floor(smallestLimit / 16)));
+  const taskCapsule = findTaskCapsule(projectedEntries, excerptCap(MAX_SHARED_TASK_CHARS));
+  const shared: SummarySharedContext = {
+    ...(preparation.previousSummary !== undefined
+      ? { previousSummary: boundContextText(preparation.previousSummary, Math.floor(smallestLimit / 2), "Previous summary") }
+      : {}),
+    ...(event.customInstructions !== undefined
+      ? { manualFocus: boundContextText(event.customInstructions, excerptCap(MAX_SHARED_FOCUS_CHARS), "Manual focus") }
+      : {}),
+    splitPrefix: buildSplitPrefixCapsule(splitPrefix, excerptCap(MAX_SHARED_PREFIX_CHARS)),
+    ...(taskCapsule ? { taskCapsule } : {}),
+  };
+  return { projectedEntries, toolInteractions, shared, plans, rollingCap: Math.max(1, Math.floor(smallestLimit / 8)) };
+}
+
+/** Per-stage output tokens and request character limits, shared by planning and execution. */
+function assignStageBudgets(plans: GroupPlan[], options: PipelineOptions, reserveTokens: number): void {
+  const llmPlans = plans.filter((plan) => plan.runLlm);
+  if (llmPlans.length === 0) return;
+  const maxInputChars = options.maxInputChars ?? DEFAULT_MAX_INPUT_CHARS;
+  const stageTokenBudget = Math.max(1, Math.floor(Math.floor(reserveTokens * 0.8) / llmPlans.length));
+  for (const plan of llmPlans) {
+    const maxTokens = getStageTokenLimit(plan.model!, stageTokenBudget, options.maxOutputTokens);
+    const contextCharBudget = Math.max(
+      1,
+      (plan.model!.contextWindow - maxTokens) * CONTEXT_CHARS_PER_TOKEN - SYSTEM_PROMPT.length,
+    );
+    plan.maxTokens = maxTokens;
+    plan.inputLimit = Math.min(maxInputChars, contextCharBudget);
+  }
 }
 
 /**
@@ -270,11 +312,16 @@ export async function runTypedPipeline(
   event.signal.throwIfAborted();
   validateOptions(options);
   validatePreparation(event);
-  const { toolInteractions, shared, plans } = preparePipelinePlans(event, ctx, options, reducers);
+  const { toolInteractions, shared, plans, rollingCap } = preparePipelinePlans(event, ctx, options, reducers);
 
   const maxInputChars = options.maxInputChars ?? DEFAULT_MAX_INPUT_CHARS;
   const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
-  const perStageOutputChars = Math.floor((maxOutputChars - plans.length * 64) / plans.length);
+  // File lists are deterministic, so they are bounded and reserved before any provider call.
+  const fileLists = summarizeFileOperations(preparation.fileOps, event.branchEntries);
+  const fileSection = formatFileOperations(fileLists.readFiles, fileLists.modifiedFiles, Math.floor(maxOutputChars / 4));
+  const perStageOutputChars = Math.floor(
+    (maxOutputChars - fileSection.length - plans.length * STAGE_HEADING_RESERVE_CHARS) / plans.length,
+  );
   if (perStageOutputChars < 1) throw new Error("Typed compaction: output limit is too small for the number of history stages");
 
   // Run trusted parsers first, so deterministic input errors and all LLM request sizes
@@ -288,76 +335,77 @@ export async function runTypedPipeline(
       toolInteractions: plan.interactions,
     };
     assertWithinLimit(JSON.stringify({ input: reducerInput, shared }), maxInputChars, `${plan.kind} reducer input`);
-    const reduced = await plan.reducer(reducerInput, shared, event.signal);
+    const reduced = await plan.reducer.call(undefined, reducerInput, shared, event.signal);
     event.signal.throwIfAborted();
     plan.reducerOutput = validateStageOutput(reduced, perStageOutputChars, `${plan.kind} reducer`);
   }
 
   const llmPlans = plans.filter((plan) => plan.runLlm);
-  const outputs: Array<{ kind: HistoryKind; text: string }> = [];
-  const stageDetails: StageDetail[] = [];
-  let totalUsage: Usage | undefined;
-  const reserveTokens = preparation.settings.reserveTokens;
-  const totalStageTokenBudget = Math.floor(reserveTokens * 0.8);
-  const stageTokenBudget = llmPlans.length > 0 ? Math.floor(totalStageTokenBudget / llmPlans.length) : 0;
-  if (llmPlans.length > 0 && stageTokenBudget < 1) {
+  if (llmPlans.length > 0 && Math.floor(Math.floor(preparation.settings.reserveTokens * 0.8) / llmPlans.length) < 1) {
     throw new Error("Typed compaction: Pi compaction reserve is too small for the configured LLM stages");
   }
 
-  // Validate every LLM prompt and its context-window estimate before sending any stage.
-  const requestTexts = new Map<GroupPlan, string>();
-  for (const plan of llmPlans) {
-    const payload = {
-      kind: plan.kind,
-      items: plan.items,
-      ...(plan.interactions.length > 0 ? { toolInteractions: plan.interactions } : {}),
-      ...(plan.reducerOutput !== undefined ? { trustedReducerOutput: plan.reducerOutput } : {}),
-      shared,
-    };
-    const requestText = `${plan.prompt ?? DEFAULT_LLM_PROMPT}\n\nTyped stage payload (JSON data):\n${JSON.stringify(payload)}`;
-    const maxTokens = getStageTokenLimit(plan.model!, stageTokenBudget, options.maxOutputTokens);
-    const contextCharBudget = Math.max(
-      1,
-      (plan.model!.contextWindow - maxTokens) * CONTEXT_CHARS_PER_TOKEN - SYSTEM_PROMPT.length,
-    );
-    assertWithinLimit(requestText, Math.min(maxInputChars, contextCharBudget), `${plan.kind} LLM request`);
-    requestTexts.set(plan, requestText);
-  }
+  // Split every LLM stage into requests that fit, before sending any of them.
+  const stageParts = new Map<GroupPlan, HistoryItem[][]>();
+  for (const plan of llmPlans) stageParts.set(plan, planStageParts(plan, shared, rollingCap));
 
+  const outputs: Array<{ kind: HistoryKind; text: string }> = [];
+  const stageDetails: StageDetail[] = [];
+  let totalUsage: Usage | undefined;
   for (const plan of plans) {
     event.signal.throwIfAborted();
     let text: string;
-    let responseUsage: Usage | undefined;
     if (plan.runLlm) {
       const model = plan.model!;
-      const requestText = requestTexts.get(plan)!;
-      const maxTokens = getStageTokenLimit(model, stageTokenBudget, options.maxOutputTokens);
+      const parts = stageParts.get(plan)!;
       const reasoningLevel = stageReasoningLevel(options.thinkingLevel);
-      const response = await ctx.modelRegistry.streamSimple(
-        model,
-        {
-          systemPrompt: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: [{ type: "text", text: requestText }], timestamp: Date.now() }],
-        },
-        {
-          maxTokens,
-          signal: event.signal,
-          cacheRetention: "none",
-          sessionId: uuidv7(),
-          ...(model.reasoning && reasoningLevel ? { reasoning: reasoningLevel } : {}),
-        },
-      ).result();
-      event.signal.throwIfAborted();
-      text = validateResponse(response, plan.kind);
-      responseUsage = validateUsage(response.usage, plan.kind);
-      if (responseUsage) totalUsage = totalUsage ? addUsage(totalUsage, responseUsage) : responseUsage;
+      let stageUsage: Usage | undefined;
+      let usageMissing = false;
+      let checkpoint: string | undefined;
+      text = "";
+      for (let index = 0; index < parts.length; index++) {
+        const requestText = buildStageRequestText(
+          plan,
+          parts[index]!,
+          shared,
+          parts.length > 1 ? { index, count: parts.length, ...(checkpoint !== undefined ? { previous: checkpoint } : {}) } : undefined,
+        );
+        assertWithinLimit(requestText, plan.inputLimit!, `${plan.kind} LLM request`);
+        const response = await ctx.modelRegistry.streamSimple(
+          model,
+          {
+            systemPrompt: SYSTEM_PROMPT,
+            messages: [{ role: "user", content: [{ type: "text", text: requestText }], timestamp: Date.now() }],
+          },
+          {
+            maxTokens: plan.maxTokens!,
+            signal: event.signal,
+            cacheRetention: "none",
+            sessionId: uuidv7(),
+            ...(model.reasoning && reasoningLevel ? { reasoning: reasoningLevel } : {}),
+          },
+        ).result();
+        event.signal.throwIfAborted();
+        text = validateResponse(response, plan.kind);
+        const responseUsage = validateUsage(response.usage, plan.kind);
+        if (responseUsage) {
+          stageUsage = stageUsage ? addUsage(stageUsage, responseUsage) : responseUsage;
+          totalUsage = totalUsage ? addUsage(totalUsage, responseUsage) : responseUsage;
+        } else {
+          usageMissing = true;
+        }
+        // An intermediate checkpoint is only input to the next part, so it is bounded rather than rejected.
+        if (index < parts.length - 1) checkpoint = boundContextText(text, rollingCap, `${kindLabel(plan.kind)} part checkpoint`);
+      }
       stageDetails.push({
         kind: plan.kind,
         strategy: plan.reducer ? "reducer+llm" : "llm",
         provider: model.provider,
         modelId: model.id,
         ...(plan.reducerName ? { reducer: plan.reducerName } : {}),
-        ...(responseUsage ? { usage: responseUsage } : {}),
+        ...(parts.length > 1 ? { parts: parts.length } : {}),
+        ...(stageUsage ? { usage: stageUsage } : {}),
+        ...(usageMissing ? { usageMissing: true as const } : {}),
       });
     } else {
       text = plan.reducerOutput!;
@@ -367,9 +415,8 @@ export async function runTypedPipeline(
     outputs.push({ kind: plan.kind, text });
   }
 
-  const fileLists = summarizeFileOperations(preparation.fileOps, event.branchEntries);
   const stageSummary = outputs.map(({ kind, text }) => `## ${kindLabel(kind)}\n${text}`).join("\n\n").trim();
-  const summary = `${stageSummary}${formatFileOperations(fileLists.readFiles, fileLists.modifiedFiles)}`.trim();
+  const summary = `${stageSummary}${fileSection}`.trim();
   if (!summary) throw new Error("Typed compaction: no summary text was produced");
   if (summary.length > maxOutputChars) {
     throw new Error(`Typed compaction: final summary exceeds the ${maxOutputChars}-character limit`);
@@ -391,6 +438,127 @@ export async function runTypedPipeline(
       },
     },
   };
+}
+
+interface PartInfo {
+  index: number;
+  count: number;
+  previous?: string;
+}
+
+/** One LLM request for a typed stage, or for one part of it. */
+function buildStageRequestText(plan: GroupPlan, items: HistoryItem[], shared: SummarySharedContext, part?: PartInfo): string {
+  const interactions = llmInteractionView(plan.kind, items, plan.interactions);
+  const payload = {
+    kind: plan.kind,
+    items,
+    ...(interactions.length > 0 ? { toolInteractions: interactions } : {}),
+    ...(plan.reducerOutput !== undefined ? { trustedReducerOutput: plan.reducerOutput } : {}),
+    shared,
+    ...(part
+      ? {
+          part: { number: part.index + 1, of: part.count },
+          ...(part.previous !== undefined ? { previousPartCheckpoint: part.previous } : {}),
+        }
+      : {}),
+  };
+  const instructions = plan.prompt ?? DEFAULT_LLM_PROMPT;
+  return `${instructions}${part ? `\n\n${CHUNK_INSTRUCTIONS}` : ""}\n\nTyped stage payload (JSON data):\n${JSON.stringify(payload)}`;
+}
+
+/**
+ * Tool links for an LLM payload. Records of the stage's own kind appear once, in `items`, and are
+ * referenced here by ordinal; the counterpart records (results for calls, calls for results) are
+ * bounded excerpts so a large tool output is not sent twice in one request.
+ */
+function llmInteractionView(kind: HistoryKind, items: HistoryItem[], interactions: ToolInteraction[]) {
+  if (interactions.length === 0) return [];
+  const ownOrdinals = new Set(items.map((item) => item.ordinal));
+  const ids = new Set(items.map((item) => item.toolCallId).filter((id): id is string => Boolean(id)));
+  const view = (record: HistoryItem) => {
+    if (record.kind === kind) return ownOrdinals.has(record.ordinal) ? { ordinal: record.ordinal } : undefined;
+    return {
+      ordinal: record.ordinal,
+      ...(record.toolName !== undefined ? { toolName: record.toolName } : {}),
+      ...(record.isError !== undefined ? { isError: record.isError } : {}),
+      text: boundContextText(record.text, MAX_TOOL_COUNTERPART_CHARS, "Linked tool record"),
+    };
+  };
+  return interactions
+    .filter((interaction) => ids.has(interaction.toolCallId))
+    .map((interaction) => {
+      const call = interaction.call ? view(interaction.call) : undefined;
+      return {
+        toolCallId: interaction.toolCallId,
+        status: interaction.status,
+        ...(interaction.call?.toolName !== undefined ? { toolName: interaction.call.toolName } : {}),
+        ...(call ? { call } : {}),
+        results: interaction.results.flatMap((result) => {
+          const rendered = view(result);
+          return rendered ? [rendered] : [];
+        }),
+      };
+    });
+}
+
+/**
+ * Split a stage's records into requests that fit its input limit. A stage that fits is sent whole.
+ * Otherwise each part reserves room for the running checkpoint of the earlier parts, and a single
+ * record that cannot fit on its own is replaced by a marked head/tail excerpt. Fails with
+ * {@link CompactInputBudgetError} only when the fixed request overhead leaves no room for records.
+ */
+function planStageParts(plan: GroupPlan, shared: SummarySharedContext, rollingCap: number): HistoryItem[][] {
+  const limit = plan.inputLimit!;
+  if (buildStageRequestText(plan, plan.items, shared).length <= limit) return [plan.items];
+
+  const worstCase: PartInfo = { index: 9_998, count: 9_999, previous: "x".repeat(rollingCap) };
+  const sizeOf = (items: HistoryItem[]) => buildStageRequestText(plan, items, shared, worstCase).length;
+  const overhead = sizeOf([]);
+  if (overhead >= limit) {
+    throw new CompactInputBudgetError(
+      `Typed compaction: ${plan.kind} LLM request overhead is ${overhead} characters; configured/model limit is ${limit}`,
+    );
+  }
+  const parts: HistoryItem[][] = [];
+  let current: HistoryItem[] = [];
+  let estimate = overhead;
+  // Estimate: the record plus its tool links; exact sizes are checked below.
+  const costOf = (item: HistoryItem) =>
+    JSON.stringify(item).length + JSON.stringify(llmInteractionView(plan.kind, [item], plan.interactions)).length + 2;
+  for (const original of plan.items) {
+    const item = overhead + costOf(original) > limit ? fitRecord(original, plan.kind, limit, sizeOf) : original;
+    const cost = costOf(item);
+    if (current.length > 0 && estimate + cost > limit) {
+      parts.push(current);
+      current = [];
+      estimate = overhead;
+    }
+    current.push(item);
+    estimate += cost;
+  }
+  if (current.length > 0) parts.push(current);
+  // Per-record estimates can miss shared tool links; split any part whose exact size is over.
+  return parts.flatMap((part) => splitUntilFits(part, limit, sizeOf));
+}
+
+function fitRecord(item: HistoryItem, kind: HistoryKind, limit: number, sizeOf: (items: HistoryItem[]) => number): HistoryItem {
+  let fitted = item;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const excess = sizeOf([fitted]) - limit;
+    if (excess <= 0) return fitted;
+    const target = fitted.text.length - excess - 64 * (attempt + 1);
+    if (target <= 0) break;
+    fitted = { ...item, text: boundContextText(item.text, target, `${kindLabel(kind)} record`) };
+  }
+  throw new CompactInputBudgetError(
+    `Typed compaction: a ${kind} record does not fit the ${limit}-character request limit even as an excerpt`,
+  );
+}
+
+function splitUntilFits(part: HistoryItem[], limit: number, sizeOf: (items: HistoryItem[]) => number): HistoryItem[][] {
+  if (part.length <= 1 || sizeOf(part) <= limit) return [part];
+  const middle = Math.ceil(part.length / 2);
+  return [...splitUntilFits(part.slice(0, middle), limit, sizeOf), ...splitUntilFits(part.slice(middle), limit, sizeOf)];
 }
 
 function validateOptions(options: PipelineOptions): void {
@@ -491,7 +659,7 @@ function validatePreparedRangeCounts(
   }
 }
 
-function findTaskCapsule(entries: SessionProjection["entries"]): SummarySharedContext["taskCapsule"] {
+function findTaskCapsule(entries: SessionProjection["entries"], maxChars: number): SummarySharedContext["taskCapsule"] {
   for (let entryIndex = entries.length - 1; entryIndex >= 0; entryIndex--) {
     const projected = entries[entryIndex];
     for (let messageIndex = projected.messages.length - 1; messageIndex >= 0; messageIndex--) {
@@ -499,10 +667,10 @@ function findTaskCapsule(entries: SessionProjection["entries"]): SummarySharedCo
       if (message.role !== "user") continue;
       const record = toHistoryItems(message, projected.sourceEntry, () => 0)[0];
       if (!record?.text.trim()) continue;
-      const truncated = record.text.length > MAX_SHARED_TASK_CHARS;
+      const truncated = record.text.length > maxChars;
       return {
         entryId: projected.sourceEntry.id,
-        text: boundContextText(record.text, MAX_SHARED_TASK_CHARS, "Task capsule"),
+        text: boundContextText(record.text, maxChars, "Task capsule"),
         truncated,
       };
     }
@@ -510,17 +678,18 @@ function findTaskCapsule(entries: SessionProjection["entries"]): SummarySharedCo
   return undefined;
 }
 
-function buildSplitPrefixCapsule(items: HistoryItem[]): string {
+function buildSplitPrefixCapsule(items: HistoryItem[], maxChars: number): string {
   if (items.length === 0) return "";
   const renderedLength = items.reduce(
     (sum, item) => sum + item.kind.length + item.text.length + 4,
     Math.max(0, items.length - 1),
   );
-  if (renderedLength <= MAX_SHARED_PREFIX_CHARS) {
+  if (renderedLength <= maxChars) {
     return items.map((item) => `[${item.kind}] ${item.text}`).join("\n");
   }
   const marker = `[Shared split-prefix excerpt; all ${items.length} projected records remain in their typed stage inputs.]`;
-  const excerptBudget = Math.max(0, MAX_SHARED_PREFIX_CHARS - marker.length - 2);
+  if (maxChars <= marker.length) return marker.slice(0, maxChars);
+  const excerptBudget = Math.max(0, maxChars - marker.length - 2);
   const headBudget = Math.floor(excerptBudget / 2);
   const tailBudget = excerptBudget - headBudget;
   const head = takeItemExcerpt(items, headBudget, false);
@@ -716,7 +885,7 @@ function buildPlans(
   for (const [kind, items] of groups) {
     const route = options.routes?.[kind] ?? {};
     const reducerName = route.reducer;
-    const reducer = reducerName ? reducers[reducerName] : undefined;
+    const reducer = reducerName && Object.hasOwn(reducers, reducerName) ? reducers[reducerName] : undefined;
     if (reducerName && typeof reducer !== "function") {
       throw new Error(`Typed compaction: reducer '${reducerName}' for ${kind} is not registered`);
     }
@@ -889,11 +1058,31 @@ function summarizeFileOperations(
   return { readFiles, modifiedFiles: [...modified].sort() };
 }
 
-function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
-  const sections: string[] = [];
-  if (readFiles.length > 0) sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
-  if (modifiedFiles.length > 0) sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
-  return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
+/**
+ * Visible file tags, bounded to `maxChars`. Modified files keep priority; omitted paths are
+ * counted in the tag, and `details` keeps the complete lists for later compactions.
+ */
+export function formatFileOperations(readFiles: string[], modifiedFiles: string[], maxChars = Number.POSITIVE_INFINITY): string {
+  const render = (read: string[], modified: string[], omittedRead: number, omittedModified: number) => {
+    const sections: string[] = [];
+    const omitted = (count: number) => (count > 0 ? `\n[${count} more not shown]` : "");
+    if (read.length > 0 || omittedRead > 0) sections.push(`<read-files>\n${read.join("\n")}${omitted(omittedRead)}\n</read-files>`);
+    if (modified.length > 0 || omittedModified > 0) {
+      sections.push(`<modified-files>\n${modified.join("\n")}${omitted(omittedModified)}\n</modified-files>`);
+    }
+    return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
+  };
+  const full = render(readFiles, modifiedFiles, 0, 0);
+  if (full.length <= maxChars) return full;
+  let read = readFiles.length;
+  let modified = modifiedFiles.length;
+  let text = full;
+  while (text.length > maxChars && (read > 0 || modified > 0)) {
+    if (read > 0) read--;
+    else modified--;
+    text = render(readFiles.slice(0, read), modifiedFiles.slice(0, modified), readFiles.length - read, modifiedFiles.length - modified);
+  }
+  return text.length <= maxChars ? text : "";
 }
 
 function kindLabel(kind: HistoryKind): string {
@@ -901,7 +1090,7 @@ function kindLabel(kind: HistoryKind): string {
     case "toolCall": return "Tool Calls";
     case "toolResult": return "Tool Results";
     case "bashExecution": return "Bash Executions";
-    case "branchSummary": return "Prior Branch Summaries";
+    case "branchSummary": return "Prior Summaries";
     default: return kind[0].toUpperCase() + kind.slice(1);
   }
 }

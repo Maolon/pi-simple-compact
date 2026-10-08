@@ -114,9 +114,15 @@ function summarizerStatusDetail(
   }
 }
 
-function reportConfiguredFailure(context: ExtensionContext, message: string): void {
+/** Configuration errors name a file and field, never file contents. */
+function configErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return message.trim() ? message.trim().replace(/\.$/, "") : "unknown configuration error";
+}
+
+function reportConfiguredFailure(context: ExtensionContext, message: string, level: "error" | "warning" = "error"): void {
   try {
-    if (context.hasUI) context.ui.notify(message, "error");
+    if (context.hasUI) context.ui.notify(message, level);
     else console.error(`[pi-simple-compact] ${message}`);
   } catch {
     // Diagnostics must not turn a fail-closed cancellation into an implicit native fallback.
@@ -178,8 +184,7 @@ async function setSessionProfile(args: string, context: ExtensionCommandContext,
     pi.appendEntry(SESSION_PROFILE_ENTRY, { version: 1, profile: requested });
     context.ui.notify(`Compaction profile set for this session: ${requested}`, "info");
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    context.ui.notify(`Could not set compaction profile: ${message}`, "error");
+    context.ui.notify(`Could not set compaction profile: ${configErrorMessage(error)}`, "error");
   }
 }
 
@@ -194,12 +199,21 @@ export function registerSimpleCompact(
   pi.on("session_before_compact", async (event, context) => {
     let profile: CompactProfile | undefined;
     try {
+      const sessionProfile = getCurrentSessionProfile(context);
+      // A session-level native choice must work even when a configuration file is broken.
+      if (sessionProfile === "native") {
+        status.clearOnNativePassThrough(context);
+        return undefined;
+      }
       const config = await loadProfileConfig(agentDir, context.cwd, context.isProjectTrusted());
-      profile = resolveProfile(config, activeChatModel(context), getCurrentSessionProfile(context));
-    } catch {
+      profile = resolveProfile(config, activeChatModel(context), sessionProfile);
+    } catch (error) {
       status.clearOnNativePassThrough(context);
       if (!event.signal.aborted) {
-        reportConfiguredFailure(context, "Profile configuration could not be resolved; compaction was canceled.");
+        reportConfiguredFailure(
+          context,
+          `Compaction profile configuration is invalid: ${configErrorMessage(error)}. Compaction was canceled. Fix the configuration, or run /compact-profile native to use Pi's native compaction in this session.`,
+        );
       }
       return { cancel: true };
     }
@@ -216,7 +230,14 @@ export function registerSimpleCompact(
       return { compaction };
     } catch (error) {
       if (event.signal.aborted) return { cancel: true };
-      if (profile.failurePolicy === "native") return undefined;
+      if (profile.failurePolicy === "native") {
+        reportConfiguredFailure(
+          context,
+          "Configured compaction could not produce a summary; using Pi's native summarizer because failurePolicy is native.",
+          "warning",
+        );
+        return undefined;
+      }
       const message = error instanceof CompactInputBudgetError
         ? "Configured compaction input exceeds the selected summarizer's context budget; no summary was stored."
         : "Configured compaction could not produce a summary; compaction was canceled instead of silently using Pi's native summarizer. Set failurePolicy to native to opt in to that fallback.";

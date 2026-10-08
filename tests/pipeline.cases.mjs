@@ -196,8 +196,14 @@ test("groups typed history, links tool IDs, routes models, shares capsule, prese
   const callPayload = promptPayload(calls[1]).payload;
   assert.equal(callPayload.toolInteractions[0].toolCallId, "call-42");
   assert.equal(callPayload.toolInteractions[0].status, "complete");
-  assert.equal(callPayload.toolInteractions[0].call.toolName, "read");
+  assert.equal(callPayload.toolInteractions[0].toolName, "read");
+  assert.deepEqual(callPayload.toolInteractions[0].call, { ordinal: callPayload.items[0].ordinal });
   assert.equal(callPayload.toolInteractions[0].results[0].text, "const answer = 42;");
+  // A tool result is sent once per request: in items for its own stage, linked by ordinal only.
+  const resultCall = promptPayload(calls[2]);
+  assert.equal(resultCall.prompt.split("const answer = 42;").length - 1, 1);
+  assert.deepEqual(resultCall.payload.toolInteractions[0].results, [{ ordinal: resultCall.payload.items[0].ordinal }]);
+  assert.match(resultCall.payload.toolInteractions[0].call.text, /src\/a\.ts/);
 
   const details = result.details.pipeline;
   assert.deepEqual(details.stages.map(({ provider, modelId }) => [provider, modelId]), [
@@ -427,7 +433,7 @@ test("applies an explicitly configured thinking level to reasoning-capable LLM s
   assert.ok(off.calls.every((call) => !("reasoning" in call.options)));
 });
 
-test("fails clearly on oversized input before any provider request", async () => {
+test("fails clearly before any provider request when fixed request overhead exceeds the limit", async () => {
   const branch = linkedEntries([
     { role: "user", content: "x".repeat(600), timestamp: 1 },
     { role: "user", content: "retained", timestamp: 2 },
@@ -437,10 +443,76 @@ test("fails clearly on oversized input before any provider request", async () =>
   const { ctx, calls } = fakeContext({ models: [summaryModel] });
 
   await assert.rejects(
-    runTypedPipeline(event, ctx, { model: "summary/bounded", maxInputChars: 500 }),
-    /user LLM request is .* configured\/model limit is 500/,
+    runTypedPipeline(event, ctx, { model: "summary/bounded", prompt: "p".repeat(600), maxInputChars: 500 }),
+    /user LLM request overhead is .* configured\/model limit is 500/,
   );
   assert.equal(calls.length, 0);
+});
+
+test("splits an oversized stage into bounded parts with a running checkpoint", async () => {
+  const records = Array.from({ length: 12 }, (_, index) => ({
+    role: "user", content: `record-${index} ${"y".repeat(300)}`, timestamp: index + 1,
+  }));
+  const branch = linkedEntries([...records, { role: "user", content: "retained", timestamp: 99 }]);
+  const event = makeEvent(branch, branch[12].id);
+  const summaryModel = model("summary", "parts");
+  const { ctx, calls } = fakeContext({
+    models: [summaryModel],
+    answer: (_model, _context, _options, index) => response(`checkpoint after part ${index + 1}`),
+  });
+
+  const result = await runTypedPipeline(event, ctx, { model: "summary/parts", maxInputChars: 3_000 });
+  assert.ok(calls.length > 1, "the stage is split into several requests");
+  const payloads = calls.map((call) => promptPayload(call));
+  for (const [index, { prompt, payload }] of payloads.entries()) {
+    assert.ok(prompt.length <= 3_000, `part ${index + 1} fits the request limit`);
+    assert.deepEqual(payload.part, { number: index + 1, of: calls.length });
+    if (index === 0) assert.equal(payload.previousPartCheckpoint, undefined);
+    else assert.equal(payload.previousPartCheckpoint, `checkpoint after part ${index}`);
+  }
+  // Every record is sent exactly once, in order.
+  const sent = payloads.flatMap(({ payload }) => payload.items.map((item) => item.text.slice(0, 9)));
+  assert.deepEqual(sent, records.map((record) => record.content.slice(0, 9)));
+  assert.match(result.summary, new RegExp(`## User\\ncheckpoint after part ${calls.length}`));
+  assert.equal(result.details.pipeline.stages[0].parts, calls.length);
+  assert.equal(result.usage.totalTokens, calls.length * 3);
+});
+
+test("sends a single record larger than the request limit as a marked excerpt", async () => {
+  const huge = `HEAD-MARK ${"z".repeat(10_000)} TAIL-MARK`;
+  const branch = linkedEntries([
+    { role: "user", content: huge, timestamp: 1 },
+    { role: "user", content: "retained", timestamp: 2 },
+  ]);
+  const event = makeEvent(branch, branch[1].id);
+  const summaryModel = model("summary", "excerpt");
+  const { ctx, calls } = fakeContext({ models: [summaryModel] });
+
+  await runTypedPipeline(event, ctx, { model: "summary/excerpt", maxInputChars: 3_000 });
+  assert.equal(calls.length, 1);
+  const { prompt, payload } = promptPayload(calls[0]);
+  assert.ok(prompt.length <= 3_000);
+  assert.match(payload.items[0].text, /^HEAD-MARK/);
+  assert.match(payload.items[0].text, /TAIL-MARK$/);
+  assert.match(payload.items[0].text, /\[User record excerpt; 10020 characters total\]/);
+});
+
+test("bounds visible file tags before any provider request and keeps full lists in details", async () => {
+  const branch = linkedEntries([
+    { role: "user", content: "touch many files", timestamp: 1 },
+    { role: "user", content: "retained", timestamp: 2 },
+  ]);
+  const many = Array.from({ length: 400 }, (_, index) => `src/generated/file-${String(index).padStart(3, "0")}.ts`);
+  const event = makeEvent(branch, branch[1].id, {
+    preparation: { fileOps: { read: new Set(), written: new Set(many), edited: new Set() } },
+  });
+  const summaryModel = model("summary", "files");
+  const { ctx } = fakeContext({ models: [summaryModel] });
+
+  const result = await runTypedPipeline(event, ctx, { model: "summary/files", maxOutputChars: 4_000 });
+  assert.ok(result.summary.length <= 4_000);
+  assert.match(result.summary, /<modified-files>\n[\s\S]*\[\d+ more not shown\]\n<\/modified-files>/);
+  assert.equal(result.details.modifiedFiles.length, 400);
 });
 
 test("rejects invalid summarizer outcomes and never returns a partial checkpoint", async (t) => {
@@ -524,6 +596,11 @@ test("rejects invalid boundaries, unknown model routes, and unregistered reducer
   await assert.rejects(
     runTypedPipeline(makeEvent(branch, branch[1].id), ctx, { routes: { user: { reducer: "not-loaded" } } }),
     /reducer 'not-loaded'.*not registered/,
+  );
+  // Inherited object members are never reducers, even with a plain-object registry.
+  await assert.rejects(
+    runTypedPipeline(makeEvent(branch, branch[1].id), ctx, { routes: { user: { reducer: "toString" } } }, {}),
+    /reducer 'toString'.*not registered/,
   );
   assert.equal(calls.length, 0);
 });
