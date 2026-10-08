@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-07
+
+First public release.
+
 ### Added
 - Compact-only Pi extension, inert until configured: with no profile, Pi compacts natively.
 - Profiles from `~/.pi/agent/pi-simple-compact.json` and, for trusted projects with `.pi/settings.json`,
