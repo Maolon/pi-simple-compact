@@ -1,6 +1,10 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   getSessionProfile,
+  loadProfileConfig,
   parseConfigFile,
   resolveProfile,
   SESSION_PROFILE_ENTRY,
@@ -133,6 +137,9 @@ describe("compact profile configuration", () => {
 
   it("rejects malformed, unknown, and non-native mode fields instead of silently using Pi defaults", () => {
     expect(() => parseConfigFile("{bad json", "fixture")).toThrow("not valid JSON");
+    // Locations only: engine messages can quote file contents.
+    expect(() => parseConfigFile('{\n  "default": oops-SECRET\n}', "fixture")).toThrow(/^fixture is not valid JSON( \(line 2, column \d+\))?$/);
+    expect(() => parseConfigFile('{\n  "default": {', "fixture")).toThrow(/^fixture is not valid JSON \(line 2, column 15\)$/);
     expect(() => parseConfigFile('{"future":true}', "fixture")).toThrow("unknown field");
     expect(() => parseConfigFile('{"default":{"model":"missing-slash"}}', "fixture")).toThrow("provider/modelId");
     expect(() => parseConfigFile('{"default":{"mode":"custom"}}', "fixture")).toThrow('must be "native"');
@@ -173,5 +180,28 @@ describe("compact profile configuration", () => {
     expect(() => parseConfigFile('{"default":{"thinkingLevel":2}}', "fixture")).toThrow("thinkingLevel must be one of");
     expect(() => parseConfigFile('{"default":{"pipeline":{"thinkingLevel":"high"}}}', "fixture"))
       .toThrow('pipeline has unknown field "thinkingLevel"');
+  });
+
+  it("rejects a broken user file without an unhandled rejection while the project trust check runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "psc-config-"));
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", record);
+    try {
+      const agentDir = join(root, "agent");
+      const cwd = join(root, "project");
+      await mkdir(agentDir, { recursive: true });
+      await mkdir(join(cwd, ".pi"), { recursive: true });
+      await writeFile(join(agentDir, "pi-simple-compact.json"), "{ broken", "utf8");
+      await writeFile(join(cwd, ".pi", "settings.json"), "{}", "utf8");
+      for (let attempt = 0; attempt < 25; attempt++) {
+        await expect(loadProfileConfig(agentDir, cwd, true)).rejects.toThrow("is not valid JSON");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", record);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
