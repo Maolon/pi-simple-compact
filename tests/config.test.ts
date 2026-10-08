@@ -141,6 +141,9 @@ describe("compact profile configuration", () => {
     expect(() => parseConfigFile('{\n  "default": oops-SECRET\n}', "fixture")).toThrow(/^fixture is not valid JSON( \(line 2, column \d+\))?$/);
     expect(() => parseConfigFile('{\n  "default": {', "fixture")).toThrow(/^fixture is not valid JSON \(line 2, column 15\)$/);
     expect(() => parseConfigFile('{"future":true}', "fixture")).toThrow("unknown field");
+    expect(() => parseConfigFile('{"default":{"prompt":"Sum {{history}}"}}', "fixture"))
+      .toThrow("fixture.default.prompt has unsupported placeholder {{history}}");
+    expect(parseConfigFile('{"default":{"prompt":"Sum {{conversation}} {{turnPrefix}}"}}', "fixture").default?.prompt).toContain("{{turnPrefix}}");
     expect(() => parseConfigFile('{"default":{"model":"missing-slash"}}', "fixture")).toThrow("provider/modelId");
     expect(() => parseConfigFile('{"default":{"mode":"custom"}}', "fixture")).toThrow('must be "native"');
     expect(() => parseConfigFile('{"models":{"provider/":{"model":"other/model"}}}', "fixture")).toThrow("provider/modelId key");

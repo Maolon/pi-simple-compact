@@ -40,6 +40,7 @@ export type SessionProfileEntry = {
 
 type ProfileField = "model" | "prompt" | "thinkingLevel" | "mode" | "failurePolicy";
 const PROFILE_FIELDS: readonly ProfileField[] = ["model", "prompt", "thinkingLevel", "mode", "failurePolicy"];
+const PROMPT_PLACEHOLDERS: readonly string[] = ["conversation", "previousSummary", "turnPrefix", "customInstructions"];
 const COMPACT_THINKING_LEVELS: readonly CompactThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PIPELINE_FIELDS = ["model", "prompt", "routes", "maxInputChars", "maxOutputChars", "maxOutputTokens"] as const;
 const PIPELINE_ROUTE_FIELDS = ["model", "prompt", "reducer"] as const;
@@ -73,6 +74,11 @@ function parseProfile(value: unknown, where: string): CompactProfile {
   if ("prompt" in value) {
     if (typeof value.prompt !== "string" || !value.prompt.trim()) {
       throw new Error(`${where}.prompt must be a non-empty string`);
+    }
+    for (const match of value.prompt.matchAll(/\{\{([^{}]+)\}\}/g)) {
+      if (!PROMPT_PLACEHOLDERS.includes(match[1]!)) {
+        throw new Error(`${where}.prompt has unsupported placeholder {{${match[1]}}}; use ${PROMPT_PLACEHOLDERS.map((key) => `{{${key}}}`).join(", ")}`);
+      }
     }
     profile.prompt = value.prompt;
   }

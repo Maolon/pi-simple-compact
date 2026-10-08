@@ -266,10 +266,10 @@ function preparePipelinePlans(
   const taskCapsule = findTaskCapsule(projectedEntries, excerptCap(MAX_SHARED_TASK_CHARS));
   const shared: SummarySharedContext = {
     ...(preparation.previousSummary !== undefined
-      ? { previousSummary: boundContextText(preparation.previousSummary, Math.floor(smallestLimit / 2), "Previous summary") }
+      ? { previousSummary: boundJsonText(preparation.previousSummary, Math.floor(smallestLimit / 2), "Previous summary") }
       : {}),
     ...(event.customInstructions !== undefined
-      ? { manualFocus: boundContextText(event.customInstructions, excerptCap(MAX_SHARED_FOCUS_CHARS), "Manual focus") }
+      ? { manualFocus: boundJsonText(event.customInstructions, excerptCap(MAX_SHARED_FOCUS_CHARS), "Manual focus") }
       : {}),
     splitPrefix: buildSplitPrefixCapsule(splitPrefix, excerptCap(MAX_SHARED_PREFIX_CHARS)),
     ...(taskCapsule ? { taskCapsule } : {}),
@@ -395,7 +395,8 @@ export async function runTypedPipeline(
           usageMissing = true;
         }
         // An intermediate checkpoint is only input to the next part, so it is bounded rather than rejected.
-        if (index < parts.length - 1) checkpoint = boundContextText(text, rollingCap, `${kindLabel(plan.kind)} part checkpoint`);
+        // Bounded by encoded length, the same reservation planStageParts made for it.
+        if (index < parts.length - 1) checkpoint = boundJsonText(text, rollingCap, `${kindLabel(plan.kind)} part checkpoint`);
       }
       stageDetails.push({
         kind: plan.kind,
@@ -537,8 +538,11 @@ function planStageParts(plan: GroupPlan, shared: SummarySharedContext, rollingCa
     estimate += cost;
   }
   if (current.length > 0) parts.push(current);
-  // Per-record estimates can miss shared tool links; split any part whose exact size is over.
-  return parts.flatMap((part) => splitUntilFits(part, limit, sizeOf));
+  // Per-record estimates are approximate: split any part whose exact size is over, and excerpt a
+  // record that is still over on its own, so every planned request fits before the first call.
+  return parts
+    .flatMap((part) => splitUntilFits(part, limit, sizeOf))
+    .map((part) => (part.length === 1 && sizeOf(part) > limit ? [fitRecord(part[0]!, plan.kind, limit, sizeOf)] : part));
 }
 
 function fitRecord(item: HistoryItem, kind: HistoryKind, limit: number, sizeOf: (items: HistoryItem[]) => number): HistoryItem {
@@ -725,6 +729,22 @@ function boundContextText(text: string, limit: number, label: string): string {
   const headLength = Math.ceil(bodyLimit / 2);
   const tailLength = bodyLimit - headLength;
   return `${text.slice(0, headLength)}${marker}${tailLength > 0 ? text.slice(-tailLength) : ""}`;
+}
+
+/**
+ * Like {@link boundContextText}, but bounds the JSON-encoded length: quotes, backslashes and
+ * newlines take two characters inside a request payload, so a raw character cap can overflow.
+ */
+function boundJsonText(text: string, limit: number, label: string): string {
+  const encodedLength = (value: string) => JSON.stringify(value).length - 2;
+  if (encodedLength(text) <= limit) return text;
+  let target = limit;
+  let bounded = boundContextText(text, target, label);
+  for (let attempt = 0; attempt < 16 && encodedLength(bounded) > limit && target > 0; attempt++) {
+    target = Math.max(0, target - (encodedLength(bounded) - limit) - 8);
+    bounded = boundContextText(text, target, label);
+  }
+  return encodedLength(bounded) <= limit ? bounded : "";
 }
 
 function isTurnStartMessage(message: ProjectedMessage): boolean {
@@ -1074,14 +1094,21 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
   };
   const full = render(readFiles, modifiedFiles, 0, 0);
   if (full.length <= maxChars) return full;
-  let read = readFiles.length;
-  let modified = modifiedFiles.length;
-  let text = full;
-  while (text.length > maxChars && (read > 0 || modified > 0)) {
-    if (read > 0) read--;
-    else modified--;
-    text = render(readFiles.slice(0, read), modifiedFiles.slice(0, modified), readFiles.length - read, modifiedFiles.length - modified);
+  // Omit read files first, then modified files; find the fewest omissions that fit.
+  const total = readFiles.length + modifiedFiles.length;
+  const withOmitted = (omitted: number) => {
+    const read = Math.max(0, readFiles.length - omitted);
+    const modified = Math.max(0, modifiedFiles.length - Math.max(0, omitted - readFiles.length));
+    return render(readFiles.slice(0, read), modifiedFiles.slice(0, modified), readFiles.length - read, modifiedFiles.length - modified);
+  };
+  let low = 1;
+  let high = total;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (withOmitted(middle).length <= maxChars) high = middle;
+    else low = middle + 1;
   }
+  const text = withOmitted(low);
   return text.length <= maxChars ? text : "";
 }
 

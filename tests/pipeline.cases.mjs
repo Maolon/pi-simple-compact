@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
-import { runTypedPipeline } from "../src/pipeline.ts";
+import { formatFileOperations, runTypedPipeline } from "../src/pipeline.ts";
 
 const model = (provider, id, overrides = {}) => ({
   provider,
@@ -476,6 +476,31 @@ test("splits an oversized stage into bounded parts with a running checkpoint", a
   assert.match(result.summary, new RegExp(`## User\\ncheckpoint after part ${calls.length}`));
   assert.equal(result.details.pipeline.stages[0].parts, calls.length);
   assert.equal(result.usage.totalTokens, calls.length * 3);
+});
+
+test("a running checkpoint full of quotes and newlines still fits every later part", async () => {
+  const records = Array.from({ length: 12 }, (_, index) => ({
+    role: "user", content: `record-${index} ${"y".repeat(300)}`, timestamp: index + 1,
+  }));
+  const branch = linkedEntries([...records, { role: "user", content: "retained", timestamp: 99 }]);
+  const event = makeEvent(branch, branch[12].id);
+  const summaryModel = model("summary", "escaped");
+  // JSON doubles every quote and newline, so a raw-length cap would overflow the reservation.
+  const { ctx, calls } = fakeContext({ models: [summaryModel], answer: () => response('"\n'.repeat(2_000)) });
+
+  await runTypedPipeline(event, ctx, { model: "summary/escaped", maxInputChars: 3_000, maxOutputChars: 200_000 })
+    .catch((error) => assert.match(String(error), /output limit/));
+  assert.ok(calls.length > 1);
+  for (const call of calls) assert.ok(promptPayload(call).prompt.length <= 3_000, "every part fits its limit");
+});
+
+test("bounds a very long file list quickly", () => {
+  const many = Array.from({ length: 20_000 }, (_, index) => `src/generated/file-${index}.ts`);
+  const started = Date.now();
+  const text = formatFileOperations(many, many.slice(0, 5_000), 8_000);
+  assert.ok(Date.now() - started < 2_000, "bounding is not quadratic");
+  assert.ok(text.length <= 8_000);
+  assert.match(text, /\[\d+ more not shown\]/);
 });
 
 test("sends a single record larger than the request limit as a marked excerpt", async () => {

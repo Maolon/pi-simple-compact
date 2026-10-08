@@ -43,7 +43,7 @@ an ordinary Pi compaction entry.
 
 ## Requirements
 
-- Pi 0.87.1 or newer (`@earendil-works/pi-coding-agent`). Tested with 0.87.1 and 1.1.0.
+- Pi (`@earendil-works/pi-coding-agent`). Tested with 0.87.1 and 1.1.0; other versions are untested.
 - Node.js 22.16 or newer.
 
 ## Install
@@ -116,10 +116,13 @@ Each profile can set:
 |---|---|
 | `model` | `provider/modelId` of the summarizer. Default: the current chat model. |
 | `prompt` | Replace Pi's compaction prompt (see [Replacement prompt](#replacement-prompt)). |
-| `pipeline` | Typed per-kind processing (see [Typed pipeline](#typed-pipeline)). Cannot be combined with `prompt`. |
+| `pipeline` | Typed per-kind processing (see [Typed pipeline](#typed-pipeline)). Cannot be combined with `prompt`, even from different files or layers. |
 | `thinkingLevel` | Summarizer reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Compaction only. |
 | `failurePolicy` | `fail` (default) or `native`. See [Failures](#failures). |
 | `mode` | `native`: hand compaction back to Pi and ignore lower-priority profiles. |
+
+A `prompt` and a `pipeline` that meet from different layers (say, a project `models` entry with `prompt` over a
+user `default` with `pipeline`) are a configuration error and cancel compaction with a notice.
 
 A profile with no `model`, `prompt` or `pipeline` does not intercept compaction. A `thinkingLevel` on its own
 therefore stays native, because it only adjusts a configured summarizer.
@@ -172,7 +175,7 @@ appears more than once, the summary passes through unchanged.
 | `{{customInstructions}}` | the text after `/compact`, if any |
 
 A placeholder you leave out is appended in a labeled block when it has a value, so the conversation is always
-included. Unknown placeholders are rejected. Read and modified files are appended as `<read-files>` and
+included. Unknown placeholders are rejected when the configuration is loaded. Read and modified files are appended as `<read-files>` and
 `<modified-files>` tags, like Pi does.
 
 ### Typed pipeline
@@ -196,8 +199,9 @@ A `pipeline` splits the history by kind and handles each kind in its own stage:
 
 - Kinds: `user`, `assistant`, `thinking`, `toolCall`, `toolResult`, `custom`, `bashExecution`, `branchSummary`
   (prior branch and compaction summaries).
-- A route can set `model`, `prompt` and `reducer`. A route with only `reducer` is handled entirely by local code. Add
-  `model` or `prompt` to pass the reducer's output on to a model.
+- A route can set `model`, `prompt` and `reducer`. A route with only `reducer` is handled entirely by local code, and
+  nothing of that kind is sent to a model. With `model` or `prompt` added, the model receives the reducer's output
+  **and** the raw records of that kind.
 - Kinds without a route use `pipeline.model`, then the profile `model`, then the current chat model.
 - Tool calls and results are linked by `toolCallId`, and a result without its call is kept.
 - Every stage receives the same bounded shared context: the previous summary, `/compact` instructions, the latest
@@ -209,20 +213,27 @@ Limits (optional, inside `pipeline`):
 | Field | Default | Meaning |
 |---|---|---|
 | `maxInputChars` | 64000 | characters per request (also capped by the model's context window) |
-| `maxOutputChars` | 32000 | characters in the final summary |
+| `maxOutputChars` | 32000 | characters in the final summary, shared equally by the kinds present; a kind whose output exceeds its share fails the compaction |
 | `maxOutputTokens` | 4096 | output tokens per stage (also capped by Pi's reserve and the model) |
 
 When a kind does not fit in one request, it is sent in parts. Each part carries a bounded checkpoint of the earlier
 parts, and the last part's answer becomes the stage output. A single record that is too large on its own is sent
-as a marked head and tail excerpt. Compaction fails only when the fixed part of a request (prompt and shared
-context) is already too large, and that check runs before any model is called.
+as a marked head and tail excerpt. Every request is planned and size-checked before the first model call.
+Compaction still fails when:
 
-`deterministic-facts` is the built-in reducer: it lists the de-duplicated records of its kind in order. JSON
-configuration can only name reducers. It cannot load code.
+- the fixed part of a request (prompt and shared context) leaves no room for records;
+- a reducer's input exceeds `maxInputChars` (reducers receive their whole kind and are not split);
+- Pi's compaction reserve is too small for the number of model stages;
+- a stage's output exceeds its share of `maxOutputChars` (checked after that stage runs).
+
+`deterministic-facts` is the built-in reducer. It lists the de-duplicated records of its kind in order, after the
+shared context (latest user request, previous summary, `/compact` instructions and split-turn excerpt), so each
+reducer section repeats that context. JSON configuration can only name reducers. It cannot load code.
 
 #### Custom reducers
 
-Trusted local code can register more reducers. Load your own extension instead of this package's default entry:
+Trusted local code can register more reducers. Write your own Pi extension or package that depends on
+`@maolon/pi-simple-compact` through npm and calls `registerSimpleCompact` with them:
 
 ```ts
 import { registerSimpleCompact, type NonLlmReducer } from "@maolon/pi-simple-compact";
@@ -235,7 +246,9 @@ const errorsOnly: NonLlmReducer = (input, _shared, signal) => {
 export default (pi) => registerSimpleCompact(pi, undefined, { reducers: { "errors-only": errorsOnly } });
 ```
 
-Reducer names cannot collide with built-ins.
+Load only that extension. Do not also `pi install` this package, or two copies register the same hook and command.
+If you must install both, disable this package's own entry in Pi settings with
+`{ "source": "npm:@maolon/pi-simple-compact", "extensions": [] }`. Reducer names cannot collide with built-ins.
 
 ## Failures
 
