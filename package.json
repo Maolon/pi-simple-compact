@@ -1,0 +1,33 @@
+{
+  "name": "pi-simple-compact",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Compact-only Pi extension with native behavior by default",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:pipeline": "node --experimental-strip-types --test tests/*.cases.mjs",
+    "test:contract": "node --experimental-strip-types --test tests/*.contract.ts",
+    "check": "npm run typecheck && npm test && npm run test:pipeline && npm run test:contract"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

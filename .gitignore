@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.pi-watcher/
+.pi/
+.env
+.env.*
+*.log
+.DS_Store
