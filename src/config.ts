@@ -191,8 +191,16 @@ export function parseConfigFile(text: string, source: string): ProfileConfigFile
   try {
     raw = JSON.parse(text);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${source} is not valid JSON: ${message}`);
+    // Report only the location: JSON engine messages can quote parts of the file.
+    const message = error instanceof Error ? error.message : "";
+    const position = /\bposition (\d+)/.exec(message);
+    let location = "";
+    if (position) {
+      const offset = Math.min(Number(position[1]), text.length);
+      const before = text.slice(0, offset).split("\n");
+      location = ` (line ${before.length}, column ${before.at(-1)!.length + 1})`;
+    }
+    throw new Error(`${source} is not valid JSON${location}`);
   }
   if (!isObject(raw)) throw new Error(`${source} must contain a JSON object`);
   for (const key of Object.keys(raw)) {
@@ -319,7 +327,9 @@ export function resolveProfile(
     const projectNamed = config.project.profiles?.[sessionProfile];
     const userNamed = config.user.profiles?.[sessionProfile];
     if (!projectNamed && !userNamed) {
-      throw new Error(`Unknown compaction profile ${JSON.stringify(sessionProfile)}`);
+      throw new Error(
+        `This session selected compaction profile ${JSON.stringify(sessionProfile)}, which is no longer configured. Run /compact-profile reset or choose another profile`,
+      );
     }
     sessionLayer = mergeProfileLayers([projectNamed, userNamed]);
   }

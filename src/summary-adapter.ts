@@ -7,7 +7,7 @@ import type {
   SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { CompactProfile } from "./config.ts";
-import { CompactInputBudgetError } from "./pipeline.ts";
+import { CompactInputBudgetError, formatFileOperations } from "./pipeline.ts";
 
 type CompactResponse = Awaited<ReturnType<ExtensionContext["modelRegistry"]["complete"]>>;
 type CompactUsage = CompactResponse["usage"];
@@ -24,6 +24,7 @@ export interface CompactSummaryAdapter {
   summarize(request: CustomSummaryRequest): Promise<CompactionResult>;
 }
 
+const MAX_REPLACEMENT_SUMMARY_CHARS = 32_000;
 const SUMMARY_SYSTEM_PROMPT =
   "You are a compaction summarizer. Write a concise, accurate summary of the supplied conversation that lets the assistant continue the user's work. Do not answer the conversation or continue it; output only the summary.";
 const TEMPLATE_KEYS = new Set([
@@ -168,18 +169,16 @@ function assertNativeModelBudget(request: CustomSummaryRequest): void {
   }
 }
 
-function appendFileTags(summary: string, files: { readFiles: string[]; modifiedFiles: string[] }): string {
-  const tags: string[] = [];
-  if (files.readFiles.length > 0) tags.push(`<read-files>\n${files.readFiles.join("\n")}\n</read-files>`);
-  if (files.modifiedFiles.length > 0) tags.push(`<modified-files>\n${files.modifiedFiles.join("\n")}\n</modified-files>`);
-  return tags.length > 0 ? `${summary.trim()}\n\n${tags.join("\n\n")}` : summary.trim();
+function appendFileTags(summary: string, fileTags: string): string {
+  return `${summary.trim()}${fileTags}`;
 }
 
 const SPLIT_TURN_MARKER = "\n\n---\n\n**Turn Context (split turn):**\n\n";
 
 /** Label Pi's split input segments without assuming either contains fresher facts. */
-function labelSplitTurnSegments(summary: string, isSplitTurn: boolean): string {
-  if (!isSplitTurn) return summary;
+function labelSplitTurnSegments(summary: string, preparation: SessionBeforeCompactEvent["preparation"]): string {
+  // Same condition under which Pi's compact() writes the split-turn section.
+  if (!preparation.isSplitTurn || preparation.turnPrefixMessages.length === 0) return summary;
   const boundary = summary.indexOf(SPLIT_TURN_MARKER);
   if (boundary < 0 || summary.indexOf(SPLIT_TURN_MARKER, boundary + SPLIT_TURN_MARKER.length) >= 0) {
     // Unknown or ambiguous upstream format: never guess the split boundary.
@@ -220,7 +219,15 @@ export async function summarizeWithPiPrompt(request: CustomSummaryRequest): Prom
   );
   event.signal.throwIfAborted();
   if (!result.summary.trim()) throw new Error("Compact summary was empty");
-  return { ...result, summary: labelSplitTurnSegments(result.summary, event.preparation.isSplitTurn) };
+  return {
+    ...result,
+    summary: labelSplitTurnSegments(result.summary, event.preparation),
+    details: {
+      ...(result.details && typeof result.details === "object" ? result.details : {}),
+      strategy: "pi-prompt-v1",
+      stages: [{ label: "pi-prompt", provider: model.provider, model: model.id }],
+    },
+  };
 }
 
 /** Whole-summary replacement adapter. The conversation and split-prefix inputs occupy distinct prompt slots. */
@@ -237,6 +244,9 @@ export const promptSummaryAdapter: CompactSummaryAdapter = {
       customInstructions: event.customInstructions ?? "",
     });
     event.signal.throwIfAborted();
+    // File tags are known before the request; bound them so they cannot fail a paid summary.
+    const files = compactFiles(request);
+    const fileTags = formatFileOperations(files.readFiles, files.modifiedFiles, Math.floor(MAX_REPLACEMENT_SUMMARY_CHARS / 4));
 
     const maxTokens = Math.min(
       Math.floor(0.8 * prep.settings.reserveTokens),
@@ -268,10 +278,9 @@ export const promptSummaryAdapter: CompactSummaryAdapter = {
     );
     event.signal.throwIfAborted();
     const summary = assertFinalResponse(response, "replacement-prompt");
-    const files = compactFiles(request);
-    const visibleSummary = appendFileTags(summary, files);
-    if (visibleSummary.length > 32_000) {
-      throw new Error("Compact replacement summary exceeds the 32000-character output limit");
+    const visibleSummary = appendFileTags(summary, fileTags);
+    if (visibleSummary.length > MAX_REPLACEMENT_SUMMARY_CHARS) {
+      throw new Error(`Compact replacement summary exceeds the ${MAX_REPLACEMENT_SUMMARY_CHARS}-character output limit`);
     }
 
     return {

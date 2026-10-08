@@ -240,12 +240,44 @@ describe("compact-only extension", () => {
     const dir = join(fx.cwd, ".pi");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "settings.json"), "{}", "utf8");
-    await writeFile(join(dir, "pi-simple-compact.json"), "{invalid", "utf8");
+    await writeFile(join(dir, "pi-simple-compact.json"), "{invalid SECRET-LOOKING-CONTENT", "utf8");
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await expect(fx.beforeCompact(event(), fx.context)).resolves.toEqual({ cancel: true });
     expect(fx.modelRegistry.streamSimple).not.toHaveBeenCalled();
-    expect(diagnostic).toHaveBeenCalledWith("[pi-simple-compact] Profile configuration could not be resolved; compaction was canceled.");
+    expect(diagnostic).toHaveBeenCalledOnce();
+    const message = String(diagnostic.mock.calls[0]![0]);
+    expect(message).toMatch(/^\[pi-simple-compact\] Compaction profile configuration is invalid: .*pi-simple-compact\.json is not valid JSON \(line 1, column 2\)\./);
+    expect(message).toContain("/compact-profile native");
+    expect(message).not.toContain("SECRET-LOOKING-CONTENT");
+    expect(message).not.toContain("invalid S");
+  });
+
+  it("lets a session native override bypass a broken configuration file", async () => {
+    const fx = await fixture();
+    const dir = join(fx.cwd, ".pi");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "settings.json"), "{}", "utf8");
+    await writeFile(join(dir, "pi-simple-compact.json"), "{invalid", "utf8");
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    fx.sessionEntries.push({ type: "custom", customType: SESSION_PROFILE_ENTRY, data: { version: 1, profile: "native" } });
+
+    await expect(fx.beforeCompact(event(), fx.context)).resolves.toBeUndefined();
+    expect(fx.modelRegistry.streamSimple).not.toHaveBeenCalled();
+    expect(diagnostic).not.toHaveBeenCalled();
+  });
+
+  it("names a removed session profile and the way out instead of a generic failure", async () => {
+    const fx = await fixture();
+    await writeProjectConfig(fx.cwd, { default: { model: "other/summarizer" } });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    fx.sessionEntries.push({ type: "custom", customType: SESSION_PROFILE_ENTRY, data: { version: 1, profile: "gone" } });
+
+    await expect(fx.beforeCompact(event(), fx.context)).resolves.toEqual({ cancel: true });
+    expect(fx.modelRegistry.streamSimple).not.toHaveBeenCalled();
+    const message = String(diagnostic.mock.calls[0]![0]);
+    expect(message).toContain('compaction profile "gone", which is no longer configured');
+    expect(message).toContain("/compact-profile reset");
   });
 
   it("uses a trusted project model-only profile with Pi's native helper and authenticated provider-neutral stream", async () => {
@@ -262,7 +294,12 @@ describe("compact-only extension", () => {
     expect(fx.modelRegistry.streamSimple.mock.calls[0]![0]).toBe(fx.alternateModel);
     expect(fx.modelRegistry.streamSimple.mock.calls[0]![2]).not.toMatchObject({ sessionId: "offline-session" });
     expect(fx.context.model).toBe(originalChatModel);
-    expect(result.compaction.details).toEqual({ readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] });
+    expect(result.compaction.details).toEqual({
+      readFiles: ["src/a.ts"],
+      modifiedFiles: ["src/b.ts"],
+      strategy: "pi-prompt-v1",
+      stages: [{ label: "pi-prompt", provider: "other", model: "summarizer" }],
+    });
     expect(result.compaction.summary).not.toContain("[HISTORY]");
     expect(result.compaction.summary).not.toContain("[TURN_PREFIX]");
   });
@@ -321,6 +358,19 @@ describe("compact-only extension", () => {
 
     const result = await fx.beforeCompact(split, fx.context) as { compaction: { summary: string } };
     expect(result.compaction.summary.split(marker)).toHaveLength(3);
+    expect(result.compaction.summary).not.toContain("[HISTORY]");
+    expect(result.compaction.summary).not.toContain("[TURN_PREFIX]");
+  });
+
+  it("does not label a split turn with no prefix messages, matching when Pi writes the split section", async () => {
+    const fx = await fixture();
+    await writeProjectConfig(fx.cwd, { default: { model: "other/summarizer" } });
+    const marker = "\n\n---\n\n**Turn Context (split turn):**\n\n";
+    fx.streams.push(assistantResponse(`History that quotes the marker${marker}once`));
+    const split = event({ preparation: preparation({ turnPrefixMessages: [], isSplitTurn: true }) });
+
+    const result = await fx.beforeCompact(split, fx.context) as { compaction: { summary: string } };
+    expect(result.compaction.summary).toContain(marker);
     expect(result.compaction.summary).not.toContain("[HISTORY]");
     expect(result.compaction.summary).not.toContain("[TURN_PREFIX]");
   });
@@ -956,7 +1006,9 @@ describe("compact activity status", () => {
     expect(fx.ui.setStatus).toHaveBeenCalledWith("pi-simple-compact", "Auto compact (chat-model)");
     await emit(fx, "session_compact", compactEvent("pi native summary", false, "threshold"));
     expect(fx.ui.setStatus).toHaveBeenLastCalledWith("pi-simple-compact", undefined);
-    expect(fx.ui.notify).not.toHaveBeenCalled();
+    // The fallback is announced once as a warning, never as a success.
+    expect(fx.ui.notify).toHaveBeenCalledOnce();
+    expect(fx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("failurePolicy is native"), "warning");
   });
 
   it("clears the status when another extension's result is persisted instead of ours", async () => {
