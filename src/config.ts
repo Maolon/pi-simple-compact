@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import type { CompactThinkingLevel, HistoryKind, PipelineOptions, PipelineRoute } from "./pipeline.ts";
@@ -19,7 +19,30 @@ export interface CompactProfile {
   failurePolicy?: "fail" | "native";
   /** Typed per-kind processing; mutually exclusive with the top-level whole-summary prompt. */
   pipeline?: PipelineOptions;
+  /** Compact an idle session after its prompt cache went cold. `false` is `{ enabled: false }`. */
+  idleCompact?: IdleCompactConfig;
 }
+
+/** One layer's idle-compaction fields; merged per field with the same precedence as the profile. */
+export interface IdleCompactConfig {
+  /** Defaults to true once any layer configures idle compaction. */
+  enabled?: boolean;
+  /** Minutes without activity after a run ends; set this to the chat provider's cache retention. */
+  afterIdleMinutes?: number;
+  /** Skip idle compaction below this many context tokens. */
+  minContextTokens?: number;
+}
+
+/** Resolved, enabled idle-compaction policy. */
+export interface IdleCompactOptions {
+  afterIdleMinutes: number;
+  minContextTokens: number;
+}
+
+export const DEFAULT_IDLE_AFTER_MINUTES = 60;
+/** Below this a cold-cache resend is cheaper than a summary call. */
+export const DEFAULT_IDLE_MIN_CONTEXT_TOKENS = 50_000;
+const IDLE_FIELDS = ["enabled", "afterIdleMinutes", "minContextTokens"] as const;
 
 export interface ProfileConfigFile {
   default?: CompactProfile;
@@ -55,7 +78,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function parseProfile(value: unknown, where: string): CompactProfile {
   if (!isObject(value)) throw new Error(`${where} must be an object`);
   for (const key of Object.keys(value)) {
-    if (!PROFILE_FIELDS.includes(key as ProfileField) && key !== "pipeline") {
+    if (!PROFILE_FIELDS.includes(key as ProfileField) && key !== "pipeline" && key !== "idleCompact") {
       throw new Error(`${where} has unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -99,10 +122,38 @@ function parseProfile(value: unknown, where: string): CompactProfile {
     profile.failurePolicy = value.failurePolicy;
   }
   if ("pipeline" in value) profile.pipeline = parsePipelineOptions(value.pipeline, `${where}.pipeline`);
+  if ("idleCompact" in value) profile.idleCompact = parseIdleCompact(value.idleCompact, `${where}.idleCompact`);
   if (profile.prompt && profile.pipeline) {
     throw new Error(`${where} cannot combine the top-level replacement prompt with a nested pipeline`);
   }
   return profile;
+}
+
+function parseIdleCompact(value: unknown, where: string): IdleCompactConfig {
+  if (value === false) return { enabled: false };
+  if (!isObject(value)) throw new Error(`${where} must be an object or false`);
+  for (const key of Object.keys(value)) {
+    if (!IDLE_FIELDS.includes(key as (typeof IDLE_FIELDS)[number])) throw new Error(`${where} has unknown field ${JSON.stringify(key)}`);
+  }
+  const options: IdleCompactConfig = {};
+  if ("enabled" in value) {
+    if (typeof value.enabled !== "boolean") throw new Error(`${where}.enabled must be true or false`);
+    options.enabled = value.enabled;
+  }
+  if ("afterIdleMinutes" in value) {
+    const minutes = value.afterIdleMinutes;
+    if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+      throw new Error(`${where}.afterIdleMinutes must be a number of minutes from 1 to 1440`);
+    }
+    options.afterIdleMinutes = minutes;
+  }
+  if ("minContextTokens" in value) {
+    if (!Number.isSafeInteger(value.minContextTokens) || (value.minContextTokens as number) < 1) {
+      throw new Error(`${where}.minContextTokens must be a positive integer`);
+    }
+    options.minContextTokens = value.minContextTokens as number;
+  }
+  return options;
 }
 
 function parsePipelineOptions(value: unknown, where: string): PipelineOptions {
@@ -231,6 +282,63 @@ async function readConfig(path: string): Promise<ProfileConfigFile> {
   }
 }
 
+/**
+ * Changes only `default.idleCompact` in the user config file, keeping every other field. The
+ * result is validated before it is written, so a command can never leave a broken file; an
+ * existing invalid file is reported, never overwritten. The write is atomic and keeps the mode.
+ */
+export async function updateUserIdleDefault(
+  agentDir: string,
+  update: (current: IdleCompactConfig | undefined) => IdleCompactConfig,
+): Promise<IdleCompactConfig> {
+  const path = join(agentDir, CONFIG_FILE_NAME);
+  let raw: Record<string, unknown> = {};
+  let mode = 0o600;
+  try {
+    const text = await readFile(path, "utf8");
+    const parsed = parseConfigFile(text, path);
+    raw = JSON.parse(text) as Record<string, unknown>;
+    mode = (await stat(path)).mode & 0o777;
+    const next = update(parsed.default?.idleCompact);
+    raw.default = { ...(isObject(raw.default) ? raw.default : {}), idleCompact: next };
+  } catch (error) {
+    if (!(isObject(error) && error.code === "ENOENT")) throw error;
+    raw = { default: { idleCompact: update(undefined) } };
+  }
+  const text = `${JSON.stringify(raw, null, 2)}\n`;
+  const written = parseConfigFile(text, path).default!.idleCompact!;
+  await mkdir(agentDir, { recursive: true });
+  const temporary = `${path}.${process.pid}.tmp`;
+  await writeFile(temporary, text, { encoding: "utf8", mode });
+  await chmod(temporary, mode);
+  await rename(temporary, path);
+  return written;
+}
+
+/** Where the effective idle setting for a session comes from, for status reports. */
+export function describeIdleSource(
+  config: LoadedProfileConfig,
+  activeChatModel: string | undefined,
+  sessionProfile: string | undefined,
+): string | undefined {
+  if (sessionProfile === "native") return "session profile native";
+  if (sessionProfile !== undefined) {
+    if (config.project.profiles?.[sessionProfile]?.idleCompact !== undefined || config.user.profiles?.[sessionProfile]?.idleCompact !== undefined) {
+      return `session profile ${sessionProfile}`;
+    }
+  }
+  const layers: Array<[string, CompactProfile | undefined]> = [
+    [`project models.${activeChatModel}`, activeChatModel ? config.project.models?.[activeChatModel] : undefined],
+    [`models.${activeChatModel}`, activeChatModel ? config.user.models?.[activeChatModel] : undefined],
+    ["project default", config.project.default],
+  ];
+  for (const [name, layer] of layers) {
+    if (layer?.idleCompact !== undefined) return name;
+    if (layer?.mode === "native") return `${name} (mode native)`;
+  }
+  return undefined;
+}
+
 async function hasPiTrustCompanion(cwd: string): Promise<boolean> {
   try {
     await access(join(cwd, ".pi", "settings.json"), constants.F_OK);
@@ -351,4 +459,51 @@ export function resolveProfile(
     config.user.default,
   ];
   return mergeProfileLayers(layers);
+}
+
+/**
+ * Idle policy for the active chat model, with the same layers and precedence as `resolveProfile`
+ * (session > project model > user model > project default > user default). Fields merge one by
+ * one. It is resolved apart from the summarizer fields because it is a trigger, not a summarizer
+ * choice: a profile with only `idleCompact` keeps Pi's native summarizer. A `native` layer means
+ * Pi's own behavior, which has no idle compaction: when nothing above configured idle compaction,
+ * it ends inheritance, exactly as it does for summarizer fields; a session `native` override
+ * always turns it off.
+ */
+export function resolveIdleCompact(
+  config: LoadedProfileConfig,
+  activeChatModel: string | undefined,
+  sessionProfile: string | undefined,
+): IdleCompactOptions | undefined {
+  if (sessionProfile === "native") return undefined;
+  const named: Array<CompactProfile | undefined> = [];
+  if (sessionProfile !== undefined) {
+    named.push(config.project.profiles?.[sessionProfile], config.user.profiles?.[sessionProfile]);
+    if (!named[0] && !named[1]) throw new Error(`Unknown compaction profile ${JSON.stringify(sessionProfile)}`);
+  }
+  const layers = [
+    ...named,
+    activeChatModel ? config.project.models?.[activeChatModel] : undefined,
+    activeChatModel ? config.user.models?.[activeChatModel] : undefined,
+    config.project.default,
+    config.user.default,
+  ];
+  const merged: IdleCompactConfig = {};
+  let configured = false;
+  for (const layer of layers) {
+    if (!layer) continue;
+    if (layer.mode === "native" && !configured && layer.idleCompact === undefined) break;
+    if (layer.idleCompact === undefined) continue;
+    configured = true;
+    for (const field of IDLE_FIELDS) {
+      if (merged[field] === undefined && layer.idleCompact[field] !== undefined) {
+        Object.assign(merged, { [field]: layer.idleCompact[field] });
+      }
+    }
+  }
+  if (!configured || merged.enabled === false) return undefined;
+  return {
+    afterIdleMinutes: merged.afterIdleMinutes ?? DEFAULT_IDLE_AFTER_MINUTES,
+    minContextTokens: merged.minContextTokens ?? DEFAULT_IDLE_MIN_CONTEXT_TOKENS,
+  };
 }

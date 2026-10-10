@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-09
+
+### Added
+- `idleCompact` profile setting: compact an idle session once the chat provider's prompt cache has gone cold, so
+  the next turn does not resend the whole context uncached. Off unless configured. Works at every profile layer
+  (session, model, default) with per-field precedence.
+- `/compact-idle [on [minutes]|off|status]` turns idle compaction on or off for all chats and shows what applies to
+  the current session.
+
 ## [0.1.1] - 2026-10-07
 
 ### Changed

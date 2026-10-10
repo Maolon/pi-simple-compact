@@ -6,6 +6,7 @@ import {
   getSessionProfile,
   loadProfileConfig,
   parseConfigFile,
+  resolveIdleCompact,
   resolveProfile,
   SESSION_PROFILE_ENTRY,
   type LoadedProfileConfig,
@@ -205,6 +206,55 @@ describe("compact profile configuration", () => {
     } finally {
       process.off("unhandledRejection", record);
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves idle compaction per field across session, model and default layers", () => {
+    const user = parseConfigFile(JSON.stringify({
+      default: { idleCompact: { afterIdleMinutes: 45 } },
+      models: {
+        "openai-codex/gpt-6-astra": { model: "google/gemini-3.8-flash", idleCompact: { minContextTokens: 200000 } },
+        "openai-codex/gpt-6-sol": { idleCompact: false },
+      },
+      profiles: { quiet: { idleCompact: false }, eager: { idleCompact: { enabled: true, afterIdleMinutes: 5 } } },
+    }), "user.json");
+    const project = parseConfigFile(JSON.stringify({ models: { "openai-codex/gpt-6-astra": { idleCompact: { afterIdleMinutes: 20 } } } }), "project.json");
+    const config: LoadedProfileConfig = { user, project };
+    // project model > user model > user default, one field at a time.
+    expect(resolveIdleCompact(config, "openai-codex/gpt-6-astra", undefined)).toEqual({ afterIdleMinutes: 20, minContextTokens: 200000 });
+    expect(resolveIdleCompact(config, "other/model", undefined)).toEqual({ afterIdleMinutes: 45, minContextTokens: 50000 });
+    // false is enabled:false and wins over the default below it.
+    expect(resolveIdleCompact(config, "openai-codex/gpt-6-sol", undefined)).toBeUndefined();
+    // Session profiles sit on top: off for this session, or re-enabled over a model's false.
+    expect(resolveIdleCompact(config, "openai-codex/gpt-6-astra", "quiet")).toBeUndefined();
+    expect(resolveIdleCompact(config, "openai-codex/gpt-6-sol", "eager")).toEqual({ afterIdleMinutes: 5, minContextTokens: 50000 });
+    // A session native override is Pi's own behavior, which has no idle compaction.
+    expect(resolveIdleCompact(config, "openai-codex/gpt-6-astra", "native")).toBeUndefined();
+    expect(() => resolveIdleCompact(config, "openai-codex/gpt-6-astra", "gone")).toThrow(/gone/);
+    // A trigger-only profile is not a summarizer profile: compaction itself stays native.
+    expect(resolveProfile(config, "other/model", undefined)).toBeUndefined();
+    expect(resolveProfile(config, "openai-codex/gpt-6-astra", undefined)).toEqual({ model: "google/gemini-3.8-flash" });
+  });
+
+  it("treats idle compaction as off until configured, defaults its fields, and lets native end inheritance", () => {
+    expect(resolveIdleCompact(emptyConfig, "a/b", undefined)).toBeUndefined();
+    const user = parseConfigFile(JSON.stringify({
+      default: { idleCompact: {} },
+      models: { "a/native": { mode: "native" }, "a/native-idle": { mode: "native", idleCompact: { afterIdleMinutes: 30 } } },
+      profiles: { on: { idleCompact: { minContextTokens: 1000 } } },
+    }), "user.json");
+    const config: LoadedProfileConfig = { user, project: {} };
+    expect(resolveIdleCompact(config, "a/b", undefined)).toEqual({ afterIdleMinutes: 60, minContextTokens: 50000 });
+    // A native model layer stops a lower default, like it does for summarizer fields...
+    expect(resolveIdleCompact(config, "a/native", undefined)).toBeUndefined();
+    // ...unless that layer or a higher one configures idle compaction itself.
+    expect(resolveIdleCompact(config, "a/native-idle", undefined)).toEqual({ afterIdleMinutes: 30, minContextTokens: 50000 });
+    expect(resolveIdleCompact(config, "a/native", "on")).toEqual({ afterIdleMinutes: 60, minContextTokens: 1000 });
+  });
+
+  it("rejects invalid idle compaction settings", () => {
+    for (const idleCompact of [true, null, { enabled: "yes" }, { afterIdleMinutes: 0 }, { afterIdleMinutes: 2000 }, { afterIdleMinutes: "5" }, { afterIdleMinutes: 5, minContextTokens: 0 }, { afterIdleMinutes: 5, extra: 1 }]) {
+      expect(() => parseConfigFile(JSON.stringify({ default: { idleCompact } }), "user.json"), JSON.stringify(idleCompact)).toThrow(/idleCompact/);
     }
   });
 });
