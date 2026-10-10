@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-09
+
 ### Added
 - `idleCompact` profile setting: compact an idle session once the chat provider's prompt cache has gone cold, so
   the next turn does not resend the whole context uncached. Off unless configured. Works at every profile layer
