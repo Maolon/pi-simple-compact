@@ -69,9 +69,12 @@ try {
     appendEntry: () => fail("appendEntry called during load"),
   });
   const events = [...handlers.keys()].sort();
-  const expected = ["session_before_compact", "session_compact", "session_compact_failed", "session_shutdown"];
+  const expected = [
+    "agent_end", "agent_start", "input", "model_select",
+    "session_before_compact", "session_compact", "session_compact_failed", "session_shutdown",
+  ];
   if (JSON.stringify(events) !== JSON.stringify(expected)) fail(`unexpected event handlers: ${events.join(", ")}`);
-  if (JSON.stringify(commands) !== JSON.stringify(["compact-profile"])) fail(`unexpected commands: ${commands.join(", ")}`);
+  if (JSON.stringify([...commands].sort()) !== JSON.stringify(["compact-idle", "compact-profile"])) fail(`unexpected commands: ${commands.join(", ")}`);
 
   // 4) zero-config yields to Pi without touching a model
   const untouched = () => fail("zero-config compaction touched the model registry or UI");

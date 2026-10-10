@@ -65,6 +65,7 @@ class PiSession {
     this.captures.push(text);
     this.sawStatus ||= /(Manual|Auto) compact \(/.test(text);
     this.sawAutoStatus ||= text.includes("Auto compact (summary)");
+    this.sawIdleStatus ||= text.includes("Idle compact (summary)");
     if (this.captures.length > 50) this.captures.shift();
     return text;
   }
@@ -235,6 +236,27 @@ const scenarios = {
     assert(compaction.fromHook === true, "the automatic compaction used the configured summarizer");
     assert(compaction.summary.includes("from e2e-summary/summary"), "the alternate model wrote the automatic summary");
     assert(pi.sawAutoStatus, "the status says Auto compact while it runs");
+  },
+
+  async "idle-cold-cache-compaction"(pi) {
+    // Off in the file; the command turns it on globally. The tiny e2e context needs a low floor.
+    pi.writeConfig({ default: { model: "e2e-summary/summary", idleCompact: { enabled: false, minContextTokens: 1 } } });
+    await pi.start();
+    await pi.type("/compact-idle on 1");
+    await pi.waitForPane((pane) => pane.includes("Idle compaction for all chats: on, after 1 min idle"), "the /compact-idle notice");
+    const written = JSON.parse(readFileSync(join(pi.agentDir, "pi-simple-compact.json"), "utf8"));
+    assert(written.default.model === "e2e-summary/summary", "the command keeps the other global settings");
+    assert(written.default.idleCompact.enabled === true && written.default.idleCompact.afterIdleMinutes === 1, "the command writes the global idle setting");
+    await seed(pi);
+    assert(pi.compactions().length === 0, "nothing compacts while the cache is warm");
+    const compaction = await pi.waitFor(() => pi.compactions()[0], "the idle compaction", 90_000);
+    assert(compaction.fromHook === true, "idle compaction goes through the configured summarizer");
+    assert(compaction.summary.includes("from e2e-summary/summary"), "the alternate model wrote the idle summary");
+    assert(pi.sawIdleStatus, "the status says Idle compact while it runs");
+    await pi.prompt("after idle compaction epsilon");
+    const last = pi.messages("assistant").at(-1).message;
+    assert(last.provider === "e2e-chat" && last.model === "chat", "chat continues on the chat model after idle compaction");
+    assert(pi.compactions().length === 1, "one idle period compacts once");
   },
 
   async "session-profile-survives-restart"(pi) {

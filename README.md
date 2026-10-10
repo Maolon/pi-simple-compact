@@ -120,6 +120,7 @@ Each profile can set:
 | `thinkingLevel` | Summarizer reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Compaction only. |
 | `failurePolicy` | `fail` (default) or `native`. See [Failures](#failures). |
 | `mode` | `native`: hand compaction back to Pi and ignore lower-priority profiles. |
+| `idleCompact` | Compact an idle session once the chat provider's prompt cache has gone cold (see [Idle compaction](#idle-compaction)). `false` turns off an inherited setting. |
 
 A `prompt` and a `pipeline` that meet from different layers (say, a project `models` entry with `prompt` over a
 user `default` with `pipeline`) are a configuration error and cancel compaction with a notice.
@@ -250,6 +251,64 @@ Load only that extension. Do not also `pi install` this package, or two copies r
 If you must install both, disable this package's own entry in Pi settings with
 `{ "source": "npm:@maolon/pi-simple-compact", "extensions": [] }`. Reducer names cannot collide with built-ins.
 
+## Idle compaction
+
+Off unless configured. Provider prompt caches expire after a period without requests. After that, the next turn
+resends the whole context at the uncached price. With `idleCompact`, the extension compacts the session while it
+sits idle after the cache has gone cold, so your next message resends a short summary instead.
+
+The quickest way to turn it on for all chats is a command:
+
+| Command | Effect |
+|---|---|
+| `/compact-idle on [minutes]` | Turns it on in `~/.pi/agent/pi-simple-compact.json` (`default.idleCompact`), optionally with a new wait. |
+| `/compact-idle off` | Turns it off there. Your minutes and token floor stay in the file for the next `on`. |
+| `/compact-idle` or `/compact-idle status` | Shows the global setting and what applies to this session, naming any model or session setting that overrides it. |
+
+The command edits only `default.idleCompact`, keeps the rest of the file and its permissions, and refuses to touch
+a file that does not parse. It takes effect from the end of the next turn. Model and session settings still win
+over the global one.
+
+`idleCompact` is a profile field like the others, so it works for all chats (`default`), per chat model (`models`)
+and per session (a named profile selected with `/compact-profile`):
+
+```json
+{
+  "default": { "idleCompact": { "afterIdleMinutes": 60 } },
+  "models": {
+    "openai-codex/gpt-6-astra": {
+      "model": "google/gemini-3.8-flash",
+      "idleCompact": { "minContextTokens": 200000 }
+    },
+    "zai/glm-5.3": { "idleCompact": false }
+  },
+  "profiles": {
+    "no-idle": { "idleCompact": false },
+    "idle-fast": { "idleCompact": { "afterIdleMinutes": 10 } }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | `true` or `false`. Defaults to `true` once any layer sets `idleCompact`. `"idleCompact": false` means `{ "enabled": false }`. |
+| `afterIdleMinutes` | 1 to 1440, default 60. How long after a run ends to wait. Set it to your provider's cache retention: the extension cannot see when a cache actually expires. |
+| `minContextTokens` | Default 50000. Smaller contexts are left alone; resending them costs less than a summary. |
+
+Fields merge one at a time with the usual [precedence](#precedence): session profile, project model, user model,
+project default, user default. In the example, astra waits 60 minutes (from `default`) and needs 200000 tokens
+(from its model entry). `/compact-profile no-idle` turns it off for the current session only, and
+`/compact-profile reset` restores the inherited setting. `native` means Pi's own behavior, which has no idle
+compaction: `/compact-profile native` turns it off for the session, and a `mode: "native"` layer stops lower layers
+from enabling it unless that layer or a higher one sets `idleCompact` itself.
+
+`idleCompact` is a trigger, not a summarizer choice. A profile with only `idleCompact` compacts with Pi's native
+summarizer; add `model`, `prompt` or `pipeline` to use a configured one, exactly as for `/compact`.
+
+The timer starts when a run ends. Any new prompt, input, model switch, compaction or shutdown cancels it. When it
+fires, the extension compacts only if Pi is idle, has no queued messages and reports at least `minContextTokens`
+of context. One idle period compacts at most once. Print and JSON runs never schedule it.
+
 ## Failures
 
 A configured compaction is rejected when the summarizer returns no text, stops because of a length limit, errors,
@@ -270,7 +329,8 @@ a large enough window, use a pipeline, or set `failurePolicy: "native"`.
 
 ## Status in the TUI
 
-While a configured compaction runs, the footer shows `Manual compact (<model>)` or `Auto compact (<model>)`. A
+While a configured compaction runs, the footer shows `Manual compact (<model>)`, `Auto compact (<model>)` or, for
+[idle compaction](#idle-compaction), `Idle compact (<model>)`. A
 pipeline shows one model when all its model stages use the same one, and otherwise `pipeline, multiple models` or
 `pipeline, local reducers`. The status disappears when compaction finishes, fails or is canceled. Native compaction
 never shows it, and print, JSON and RPC modes are not affected.
