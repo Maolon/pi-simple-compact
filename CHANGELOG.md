@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-09
+
+### Changed
+- README: idle (cold-cache) compaction is introduced in the opening, Why and How it works sections, with the
+  cost case and `/compact-idle on`; examples use current models (`openai-codex/gpt-6-astra`, `google/gemini-3.8-flash`).
+  No code changes.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added
