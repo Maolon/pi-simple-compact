@@ -1,7 +1,8 @@
 # pi-simple-compact
 
-Choose the model, the prompt and the pipeline [Pi](https://pi.dev) uses when it compacts a session, and change
-nothing else. With no configuration this extension does nothing at all: Pi compacts exactly as it always does.
+Choose the model, the prompt and the pipeline [Pi](https://pi.dev) uses when it compacts a session, and optionally
+compact an idle session once its prompt cache has gone cold. Nothing else changes. With no configuration this
+extension does nothing at all: Pi compacts exactly as it always does.
 
 ```bash
 pi install npm:@maolon/pi-simple-compact
@@ -17,14 +18,20 @@ current chat model and its built-in prompt. That is a good default, but sometime
 - **Your own prompt.** Keep the details your work depends on, in the shape you want.
 - **Typed processing.** Summarize tool output, user requests and assistant reasoning differently, or reduce some of
   them with deterministic local code instead of a model.
+- **Cold-cache compaction.** Provider prompt caches expire while you are away. The next message then resends the
+  whole context at the uncached price, which for a long session on a frontier model can cost dollars per turn.
+  [Idle compaction](#idle-compaction) compacts the session while it sits idle after the cache has gone cold, so you
+  come back to a short summary instead. Turn it on with `/compact-idle on`.
 
-pi-simple-compact does this **only inside compaction**. It never changes your chat model, thinking level, trigger
-thresholds, tools, session history, `/tree` branch summaries or any other hook.
+pi-simple-compact does this **only inside compaction**. It never changes your chat model, thinking level, Pi's own
+trigger thresholds, tools, session history, `/tree` branch summaries or any other hook. The one trigger it adds,
+idle compaction, is off until you turn it on.
 
 ## How it works
 
 ```
  Pi decides to compact (/compact, threshold or overflow)
+   or idle compaction calls Pi's compact after the cache went cold (opt-in)
             │
             ▼
  session_before_compact ──► resolve profile ──► none / native ──► return nothing: Pi compacts natively
@@ -53,24 +60,37 @@ pi install npm:@maolon/pi-simple-compact
 ```
 
 Use `-l` to install into the current project (`.pi/settings.json`) instead of your personal settings, or try it
-for one run with `pi -e npm:@maolon/pi-simple-compact`. Pin versions with `npm:@maolon/pi-simple-compact@0.1.0`.
+for one run with `pi -e npm:@maolon/pi-simple-compact`. Pin versions with `npm:@maolon/pi-simple-compact@0.2.0`.
 
 Nothing changes until you add a profile.
 
 ## Quick start
 
-Compact with a cheaper model while you keep chatting with your current one. Create
+Chat with an expensive model and compact with a fast, cheap one. For example, while you chat with
+`openai-codex/gpt-6-astra`, let `google/gemini-3.8-flash` write the summaries. Create
 `~/.pi/agent/pi-simple-compact.json`:
 
 ```json
 {
-  "default": { "model": "google/gemini-2.5-flash" }
+  "models": {
+    "openai-codex/gpt-6-astra": { "model": "google/gemini-3.8-flash", "thinkingLevel": "high" }
+  }
 }
 ```
 
-The model is an exact, case-sensitive `provider/modelId` from `pi --list-models`. Pi's registry provides its
-credentials. Run `/compact` and the summary comes from that model through Pi's own compaction prompt. During the
-compaction the footer shows `Manual compact (gemini-2.5-flash)` (`Auto compact (...)` for automatic ones).
+Models are exact, case-sensitive `provider/modelId` values from `pi --list-models`. Pi's registry provides their
+credentials. Run `/compact` and the summary comes from Gemini through Pi's own compaction prompt, while chat stays on
+astra. During the compaction the footer shows `Manual compact (gemini-3.8-flash)` (`Auto compact (...)` for automatic
+ones). Use `default` instead of `models` to compact every chat model this way.
+
+Then, to stop paying for a cold cache after a break, run:
+
+```
+/compact-idle on 60
+```
+
+From now on, a session left idle for 60 minutes is compacted before you come back (see
+[Idle compaction](#idle-compaction)).
 
 > **Privacy.** A configured summarizer receives the history being compacted, including tool calls and tool output,
 > from the session. If you choose a different provider from your chat provider, that data goes to it. A typed
@@ -93,13 +113,17 @@ Pi settings file that trust covers.
 
 ```json
 {
-  "default": { "model": "google/gemini-2.5-flash" },
+  "default": { "model": "google/gemini-3.8-flash" },
   "models": {
-    "anthropic/claude-sonnet-4": { "model": "google/gemini-2.5-flash", "thinkingLevel": "high" }
+    "openai-codex/gpt-6-astra": {
+      "model": "google/gemini-3.8-flash",
+      "thinkingLevel": "high",
+      "idleCompact": { "afterIdleMinutes": 60 }
+    }
   },
   "profiles": {
     "focused": {
-      "model": "google/gemini-2.5-flash",
+      "model": "google/gemini-3.8-flash",
       "prompt": "Summarize this coding session.\n{{conversation}}\nPrior summary: {{previousSummary}}\nFocus: {{customInstructions}}"
     }
   }
@@ -186,12 +210,12 @@ A `pipeline` splits the history by kind and handles each kind in its own stage:
 ```json
 {
   "default": {
-    "model": "google/gemini-2.5-flash",
+    "model": "google/gemini-3.8-flash",
     "pipeline": {
       "routes": {
         "user": { "reducer": "deterministic-facts" },
         "assistant": { "prompt": "Keep decisions, progress and next steps." },
-        "toolResult": { "model": "openai/gpt-5-mini" }
+        "toolResult": { "model": "google/gemini-3.7-flash" }
       }
     }
   }
@@ -256,6 +280,12 @@ If you must install both, disable this package's own entry in Pi settings with
 Off unless configured. Provider prompt caches expire after a period without requests. After that, the next turn
 resends the whole context at the uncached price. With `idleCompact`, the extension compacts the session while it
 sits idle after the cache has gone cold, so your next message resends a short summary instead.
+
+For example, a `gpt-6-astra` session at 600k tokens costs about $12 to resend uncached (input above 272k tokens is
+$20/M, against $2/M from cache). Compacting it with `gemini-3.8-flash` costs about $0.20, and the next turn starts
+from a summary of a few tens of thousands of tokens. Compacting while the cache is still warm would save nothing on
+the summary itself, because Pi's summary requests do not use the prompt cache. The extension therefore waits for the
+cache to go cold.
 
 The quickest way to turn it on for all chats is a command:
 
@@ -344,15 +374,17 @@ never shows it, and print, JSON and RPC modes are not affected.
 
 ## Status
 
-0.1 is an early release.
+0.2 is an early release.
 
 - **Tested automatically:** every strategy, profile precedence, project trust gating, session profiles across
   restarts, failures, cancellation and status cleanup. The tests use a real Pi `AgentSession` and fake
   providers. A tmux suite drives the real Pi TUI with offline providers through native, model-only, failing,
-  broken-config, pipeline, automatic-threshold and restart scenarios. The offline suites run against Pi 0.87.1 and
+  broken-config, pipeline, automatic-threshold, idle-compaction (`/compact-idle on`, then an idle compaction after one
+  minute) and restart scenarios. The offline suites run against Pi 0.87.1 and
   1.1.0.
 - **Tested by hand:** a few real providers, including a cross-provider summarizer and a hybrid pipeline. Other
-  providers have not been tried. Overflow-triggered compaction has not been reproduced with a real provider.
+  providers have not been tried. Overflow-triggered compaction has not been reproduced with a real provider. Idle compaction has not yet been run
+  against a real provider's cache expiry; `afterIdleMinutes` is your statement of the cache retention.
 - **Not included:** a reconciliation pass that resolves contradictions between the two parts of a split-turn summary.
   The labels only mark which part is which.
 
