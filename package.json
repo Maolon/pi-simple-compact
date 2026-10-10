@@ -1,6 +1,6 @@
 {
   "name": "@maolon/pi-simple-compact",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Choose the model, prompt and pipeline Pi uses to compact a session, without touching anything else. Inert until configured.",
   "keywords": [
     "pi-package",
