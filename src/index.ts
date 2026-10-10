@@ -6,20 +6,26 @@ import type {
   SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+  DEFAULT_IDLE_AFTER_MINUTES,
+  DEFAULT_IDLE_MIN_CONTEXT_TOKENS,
+  describeIdleSource,
   getSessionProfile,
   loadProfileConfig,
+  resolveIdleCompact,
   resolveProfile,
   SESSION_PROFILE_ENTRY,
+  updateUserIdleDefault,
 } from "./config.ts";
-import type { CompactProfile } from "./config.ts";
+import type { CompactProfile, IdleCompactConfig } from "./config.ts";
 import { compactStatusLabel, createCompactStatusTracker } from "./compact-status.ts";
+import { createIdleCompactScheduler } from "./idle-compact.ts";
 import { CompactInputBudgetError, describePipelineSummarizers, runTypedPipeline } from "./pipeline.ts";
 import type { NonLlmReducer, PipelineOptions } from "./pipeline.ts";
 import { deterministicFactsReducer } from "./reducers.ts";
 import { promptSummaryAdapter, summarizeWithPiPrompt } from "./summary-adapter.ts";
 import type { CompactSummaryAdapter, CustomSummaryRequest } from "./summary-adapter.ts";
 
-export type { CompactProfile, ProfileConfigFile } from "./config.ts";
+export type { CompactProfile, IdleCompactConfig, IdleCompactOptions, ProfileConfigFile } from "./config.ts";
 export type {
   CompactThinkingLevel,
   HistoryItem,
@@ -133,7 +139,7 @@ function configErrorMessage(error: unknown): string {
   return message.trim() ? message.trim().replace(/\.$/, "") : "unknown configuration error";
 }
 
-function reportConfiguredFailure(context: ExtensionContext, message: string, level: "error" | "warning" = "error"): void {
+function reportConfiguredFailure(context: ExtensionContext, message: string, level: "error" | "warning" | "info" = "error"): void {
   try {
     if (context.hasUI) context.ui.notify(message, level);
     else console.error(`[pi-simple-compact] ${message}`);
@@ -201,6 +207,61 @@ async function setSessionProfile(args: string, context: ExtensionCommandContext,
   }
 }
 
+function describeIdle(policy: { afterIdleMinutes: number; minContextTokens: number } | undefined): string {
+  return policy ? `on, after ${policy.afterIdleMinutes} min idle, at least ${policy.minContextTokens} context tokens` : "off";
+}
+
+function describeGlobalIdle(config: IdleCompactConfig | undefined): string {
+  if (!config || config.enabled === false) return "off";
+  return describeIdle({
+    afterIdleMinutes: config.afterIdleMinutes ?? DEFAULT_IDLE_AFTER_MINUTES,
+    minContextTokens: config.minContextTokens ?? DEFAULT_IDLE_MIN_CONTEXT_TOKENS,
+  });
+}
+
+/** `/compact-idle [on [minutes]|off|status]`: the global (user default) idle setting plus this session's effective one. */
+async function idleCommand(args: string, context: ExtensionCommandContext, agentDir: string): Promise<void> {
+  const [action = "status", minutesArg, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+  const usage = "Usage: /compact-idle [on [minutes]|off|status]";
+  try {
+    if (rest.length > 0 || (action !== "on" && minutesArg !== undefined)) {
+      context.ui.notify(usage, "error");
+      return;
+    }
+    if (action === "on" || action === "off") {
+      let minutes: number | undefined;
+      if (minutesArg !== undefined) {
+        minutes = Number(minutesArg);
+        if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+          context.ui.notify("Idle minutes must be a number from 1 to 1440.", "error");
+          return;
+        }
+      }
+      await updateUserIdleDefault(agentDir, (current) => ({
+        ...(current ?? {}),
+        enabled: action === "on",
+        ...(minutes !== undefined ? { afterIdleMinutes: minutes } : {}),
+      }));
+    } else if (action !== "status") {
+      context.ui.notify(usage, "error");
+      return;
+    }
+    const config = await loadProfileConfig(agentDir, context.cwd, context.isProjectTrusted());
+    const sessionProfile = getCurrentSessionProfile(context);
+    const chatModel = activeChatModel(context);
+    const effective = resolveIdleCompact(config, chatModel, sessionProfile);
+    const source = describeIdleSource(config, chatModel, sessionProfile);
+    const lines = [
+      `Idle compaction for all chats: ${describeGlobalIdle(config.user.default?.idleCompact)}.`,
+      `This session (${chatModel ?? "no model"}): ${describeIdle(effective)}${source ? `, set by ${source}` : ""}.`,
+    ];
+    if (action !== "status") lines.push("It applies from the end of the next turn.");
+    context.ui.notify(lines.join("\n"), "info");
+  } catch (error) {
+    context.ui.notify(`Could not ${action === "status" ? "read" : "change"} idle compaction: ${configErrorMessage(error)}`, "error");
+  }
+}
+
 export function registerSimpleCompact(
   pi: ExtensionAPI,
   adapter: CompactSummaryAdapter = promptSummaryAdapter,
@@ -209,7 +270,16 @@ export function registerSimpleCompact(
   const agentDir = options.agentDir ?? getAgentDir();
   const reducers = createCompactReducerRegistry(options.reducers);
   const status = createCompactStatusTracker();
+  const idle = createIdleCompactScheduler({
+    resolve: async (context) => {
+      const sessionProfile = getCurrentSessionProfile(context);
+      const config = await loadProfileConfig(agentDir, context.cwd, context.isProjectTrusted());
+      return resolveIdleCompact(config, activeChatModel(context), sessionProfile);
+    },
+    report: (context, message, level) => reportConfiguredFailure(context, message, level),
+  });
   pi.on("session_before_compact", async (event, context) => {
+    const idleTriggered = idle.consumeIdleTrigger();
     let profile: CompactProfile | undefined;
     try {
       const sessionProfile = getCurrentSessionProfile(context);
@@ -237,7 +307,7 @@ export function registerSimpleCompact(
       return undefined;
     }
 
-    status.begin(context, compactStatusLabel(event.reason, summarizerStatusDetail(event, context, profile, reducers)));
+    status.begin(context, compactStatusLabel(idleTriggered ? "idle" : event.reason, summarizerStatusDetail(event, context, profile, reducers)));
     try {
       const compaction = await runConfiguredSummary(event, context, profile, adapter, reducers);
       return { compaction };
@@ -260,13 +330,35 @@ export function registerSimpleCompact(
   });
 
   // Terminal compact lifecycle events clear the transient status without false success.
-  pi.on("session_compact", (_event, context) => status.handleCompact(context));
+  pi.on("session_compact", (_event, context) => {
+    idle.cancel();
+    status.handleCompact(context);
+  });
   pi.on("session_compact_failed", (_event, context) => status.handleCompactFailed(context));
-  pi.on("session_shutdown", (_event, context) => status.handleShutdown(context));
+  pi.on("session_shutdown", (_event, context) => {
+    idle.cancel();
+    status.handleShutdown(context);
+  });
+
+  // Idle compaction: a run's end starts the cold-cache timer; any new activity ends it.
+  pi.on("agent_end", (_event, context) => idle.schedule(context));
+  pi.on("agent_start", () => idle.cancel());
+  pi.on("input", () => idle.cancel());
+  pi.on("model_select", () => idle.cancel());
 
   pi.registerCommand("compact-profile", {
     description: "Set or clear the current session's simple-compact profile",
     handler: async (args, context) => setSessionProfile(args, context, pi, agentDir),
+  });
+
+  pi.registerCommand("compact-idle", {
+    description: "Turn idle (cold-cache) compaction on or off for all chats, or show its status",
+    getArgumentCompletions: (prefix) => [
+      { value: "on", label: "on", description: "Turn on for all chats; optionally add minutes, e.g. on 60" },
+      { value: "off", label: "off", description: "Turn off for all chats" },
+      { value: "status", label: "status", description: "Show the global and this session's setting" },
+    ].filter((item) => item.value.startsWith(prefix.trim())),
+    handler: async (args, context) => idleCommand(args, context, agentDir),
   });
 }
 

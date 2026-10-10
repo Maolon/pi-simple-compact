@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -130,16 +130,18 @@ async function fixture(options: { projectTrusted?: boolean; mode?: ExtensionMode
   let command: { handler: (args: string, ctx: never) => Promise<void> } | undefined;
   const handlers = new Map<string, (ev: unknown, ctx: unknown) => unknown>();
   const appendedEntries: Array<{ customType: string; data: unknown }> = [];
+  const commands = new Map<string, NonNullable<typeof command>>();
   const api = {
     on: vi.fn((name: string, handler: (ev: unknown, ctx: unknown) => unknown) => {
       handlers.set(name, handler);
       if (name === "session_before_compact") beforeCompact = handler;
       return () => undefined;
     }),
-    registerCommand: vi.fn((_name: string, registered: typeof command) => { command = registered; }),
+    registerCommand: vi.fn((name: string, registered: typeof command) => { commands.set(name, registered!); }),
     appendEntry: vi.fn((customType: string, data: unknown) => appendedEntries.push({ customType, data })),
   } as unknown as ExtensionAPI;
   registerSimpleCompact(api, undefined, { agentDir });
+  command = commands.get("compact-profile");
   if (!beforeCompact || !command) throw new Error("Extension did not register its compact hook and command");
 
   return {
@@ -159,6 +161,7 @@ async function fixture(options: { projectTrusted?: boolean; mode?: ExtensionMode
     handlers,
     beforeCompact: beforeCompact as (ev: unknown, ctx: unknown) => Promise<unknown>,
     command,
+    commands,
     appendedEntries,
   };
 }
@@ -1079,5 +1082,171 @@ describe("compact activity status", () => {
       ui: brokenCompletionUi,
     } as unknown as ExtensionContext)).not.toThrow();
     expect(brokenCompletionUi.setStatus).toHaveBeenCalledWith("pi-simple-compact", undefined);
+  });
+});
+
+describe("idle compaction after the prompt cache goes cold", () => {
+  afterEach(() => vi.useRealTimers());
+
+  async function idleFixture(options: { mode?: ExtensionMode; tokens?: number | null; idle?: boolean } = {}) {
+    const fx = await fixture({ mode: options.mode ?? "tui" });
+    const compact = vi.fn();
+    Object.assign(fx.context, {
+      isIdle: vi.fn(() => options.idle ?? true),
+      hasPendingMessages: vi.fn(() => false),
+      getContextUsage: vi.fn(() => ({ tokens: options.tokens === undefined ? 300_000 : options.tokens, contextWindow: 872_000, percent: null })),
+      compact,
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const handler = (name: string) => fx.handlers.get(name)!;
+    const endRun = () => handler("agent_end")({ type: "agent_end", messages: [] }, fx.context) as Promise<void>;
+    return { ...fx, compact, handler, endRun };
+  }
+
+  it("does nothing without an idle policy", async () => {
+    const fx = await idleFixture();
+    await writeUserConfig(fx.agentDir, { default: { model: "other/summarizer" } });
+    await fx.endRun();
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    expect(fx.compact).not.toHaveBeenCalled();
+  });
+
+  it("compacts once after the configured idle time and labels the running compaction", async () => {
+    const fx = await idleFixture();
+    await writeUserConfig(fx.agentDir, { models: { "chat/chat-model": { model: "other/summarizer", idleCompact: { afterIdleMinutes: 10, minContextTokens: 100_000 } } } });
+    await fx.endRun();
+    vi.advanceTimersByTime(10 * 60_000 - 1);
+    expect(fx.compact).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fx.compact).toHaveBeenCalledTimes(1);
+    expect(fx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Compacting 300000 context tokens"), "info");
+
+    fx.streams.push(assistantResponse("idle summary"));
+    const result = await fx.beforeCompact(event({ reason: "manual" }), fx.context) as { compaction: { summary: string } };
+    expect(result.compaction.summary).toContain("idle summary");
+    expect(fx.ui.setStatus).toHaveBeenCalledWith("pi-simple-compact", "Idle compact (summarizer)");
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    expect(fx.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("is cancelled by new activity, a model change, or shutdown before it fires", async () => {
+    for (const name of ["agent_start", "input", "model_select", "session_shutdown"]) {
+      const fx = await idleFixture();
+      await writeUserConfig(fx.agentDir, { default: { idleCompact: { afterIdleMinutes: 5 } } });
+      await fx.endRun();
+      vi.advanceTimersByTime(4 * 60_000);
+      fx.handler(name)({ type: name }, fx.context);
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(fx.compact, name).not.toHaveBeenCalled();
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips small contexts, busy sessions, unknown usage, and print/json runs", async () => {
+    const cases = [{ tokens: 49_999 }, { idle: false }, { tokens: null }, { mode: "print" as const }, { mode: "json" as const }];
+    for (const options of cases) {
+      const fx = await idleFixture(options);
+      await writeUserConfig(fx.agentDir, { default: { idleCompact: { afterIdleMinutes: 5 } } });
+      await fx.endRun();
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(fx.compact, JSON.stringify(options)).not.toHaveBeenCalled();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a real idle compaction failure but not a fail-closed cancellation", async () => {
+    const fx = await idleFixture({ mode: "rpc" });
+    await writeUserConfig(fx.agentDir, { default: { idleCompact: { afterIdleMinutes: 5 } } });
+    for (const [message, reported] of [["Compaction cancelled", false], ["Codex error: overloaded", true]] as const) {
+      fx.compact.mockClear();
+      fx.ui.notify.mockClear();
+      await fx.endRun();
+      vi.advanceTimersByTime(5 * 60_000);
+      const options = fx.compact.mock.calls[0]![0] as { onError: (error: Error) => void };
+      options.onError(new Error(message));
+      const warned = fx.ui.notify.mock.calls.some(([text, level]) => level === "warning" && String(text).includes(message));
+      expect(warned, message).toBe(reported);
+    }
+  });
+
+  it("follows the session's /compact-profile choice: a named profile or native", async () => {
+    for (const [profile, expected] of [[undefined, 1], ["quiet", 0], ["native", 0]] as const) {
+      const fx = await idleFixture();
+      await writeUserConfig(fx.agentDir, {
+        models: { "chat/chat-model": { idleCompact: { afterIdleMinutes: 5 } } },
+        profiles: { quiet: { idleCompact: false } },
+      });
+      if (profile) fx.sessionEntries.push({ type: "custom", customType: SESSION_PROFILE_ENTRY, data: { version: 1, profile } });
+      await fx.endRun();
+      vi.advanceTimersByTime(5 * 60_000);
+      expect(fx.compact, String(profile)).toHaveBeenCalledTimes(expected);
+      vi.useRealTimers();
+    }
+  });
+
+  it("/compact-idle on|off writes only the global default and keeps every other setting", async () => {
+    const fx = await idleFixture();
+    const run = (args: string) => fx.commands.get("compact-idle")!.handler(args, fx.context as never);
+    const file = join(fx.agentDir, "pi-simple-compact.json");
+    const read = async () => JSON.parse(await readFile(file, "utf8"));
+
+    await run("on");
+    expect(await read()).toEqual({ default: { idleCompact: { enabled: true } } });
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    expect(fx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("all chats: on, after 60 min idle"), "info");
+    await fx.endRun();
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(fx.compact).toHaveBeenCalledTimes(1);
+
+    await writeUserConfig(fx.agentDir, {
+      default: { model: "other/summarizer", idleCompact: { minContextTokens: 1000 } },
+      models: { "x/y": { prompt: "Summarize {{conversation}}" } },
+    });
+    await run("on 30");
+    expect(await read()).toEqual({
+      default: { model: "other/summarizer", idleCompact: { minContextTokens: 1000, enabled: true, afterIdleMinutes: 30 } },
+      models: { "x/y": { prompt: "Summarize {{conversation}}" } },
+    });
+    await run("off");
+    expect((await read()).default.idleCompact).toEqual({ minContextTokens: 1000, enabled: false, afterIdleMinutes: 30 });
+    expect(fx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("all chats: off"), "info");
+    fx.compact.mockClear();
+    await fx.endRun();
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    expect(fx.compact).not.toHaveBeenCalled();
+  });
+
+  it("/compact-idle status names a higher layer that overrides the global setting", async () => {
+    const fx = await idleFixture();
+    await writeUserConfig(fx.agentDir, { default: { idleCompact: {} }, models: { "chat/chat-model": { idleCompact: false } } });
+    await fx.commands.get("compact-idle")!.handler("", fx.context as never);
+    const text = String(fx.ui.notify.mock.calls.at(-1)![0]);
+    expect(text).toContain("all chats: on, after 60 min idle, at least 50000 context tokens");
+    expect(text).toContain("This session (chat/chat-model): off, set by models.chat/chat-model");
+  });
+
+  it("/compact-idle never overwrites an invalid file and rejects bad arguments", async () => {
+    const fx = await idleFixture();
+    const run = (args: string) => fx.commands.get("compact-idle")!.handler(args, fx.context as never);
+    await mkdir(fx.agentDir, { recursive: true });
+    const file = join(fx.agentDir, "pi-simple-compact.json");
+    await writeFile(file, "{ broken", "utf8");
+    await run("on");
+    expect(await readFile(file, "utf8")).toBe("{ broken");
+    expect(fx.ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/Could not change idle compaction: .*not valid JSON/), "error");
+    for (const args of ["on 0", "on soon", "off 5", "maybe", "on 5 6"]) {
+      await run(args);
+      expect(fx.ui.notify, args).toHaveBeenLastCalledWith(expect.stringMatching(/Usage|1 to 1440/), "error");
+    }
+    expect(await readFile(file, "utf8")).toBe("{ broken");
+  });
+
+  it("ignores a stale context instead of throwing from the timer", async () => {
+    const fx = await idleFixture();
+    await writeUserConfig(fx.agentDir, { default: { idleCompact: { afterIdleMinutes: 5 } } });
+    await fx.endRun();
+    (fx.context as unknown as { isIdle: () => boolean }).isIdle = () => { throw new Error("stale extension context"); };
+    expect(() => vi.advanceTimersByTime(5 * 60_000)).not.toThrow();
+    expect(fx.compact).not.toHaveBeenCalled();
   });
 });

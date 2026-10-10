@@ -7,12 +7,14 @@ export const COMPACT_STATUS_KEY = "pi-simple-compact";
 export const AUTO_COMPACT_LABEL = "Auto compact";
 /** Prefix used for manual /compact invocations. */
 export const MANUAL_COMPACT_LABEL = "Manual compact";
+/** Prefix used when this extension compacts an idle session whose cache went cold. */
+export const IDLE_COMPACT_LABEL = "Idle compact";
 
-export type CompactStatusReason = "manual" | "threshold" | "overflow";
+export type CompactStatusReason = "manual" | "threshold" | "overflow" | "idle";
 
 /** Builds the in-progress label, e.g. `Auto compact (claude-sonnet-4)`. */
 export function compactStatusLabel(reason: CompactStatusReason, summarizerDetail: string): string {
-  const prefix = reason === "manual" ? MANUAL_COMPACT_LABEL : AUTO_COMPACT_LABEL;
+  const prefix = reason === "idle" ? IDLE_COMPACT_LABEL : reason === "manual" ? MANUAL_COMPACT_LABEL : AUTO_COMPACT_LABEL;
   return `${prefix} (${summarizerDetail})`;
 }
 
